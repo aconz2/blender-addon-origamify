@@ -137,7 +137,8 @@ def origami(obj, breadthfirst=True):
     mesh.faces.ensure_lookup_table()
 
     g = face_connectivity_graph(mesh)
-    st, parents = spanning_tree(g, breadthfirst=breadthfirst)
+    start = mesh.faces.active.index if mesh.faces.active else None
+    st, parents = spanning_tree(g, breadthfirst=breadthfirst, start=start)
     if len(parents) != len(mesh.faces):
         print('WARNING: spanning tree did not visit all faces, missing {}'.format(len(mesh.faces) - len(parents)))
 
@@ -224,15 +225,23 @@ def dev():
 
     # animate(root, 'ALL', 'UNFOLD', 0, 10, True)
 
-def unfold_object(obj):
+def unfold_object(obj, recursively=False):
     angle = obj.get('origami_dihedral_angle')
     if angle is not None:
         obj.rotation_euler.x = obj.rotation_euler.x + angle
 
-def fold_object(obj):
+    if recursively:
+        for child in obj.children:
+            unfold_object(child, recursively)
+
+def fold_object(obj, recursively=False):
     angle = obj.get('origami_original_angle')
     if angle is not None:
         obj.rotation_euler.x = angle
+
+    if recursively:
+        for child in obj.children:
+            fold_object(child, recursively)
 
 def bfs(root):
     for child in root.children:
@@ -317,7 +326,8 @@ class Origamify(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     breadthfirst: bpy.props.BoolProperty(name='Breadthfirst', default=True)
-    # TODO: add an option for the starting face
+    constrain_root: bpy.props.BoolProperty(name='Constrain Root', default=False, description='Add an X Limit Rotation Constraint to the root object to always be 0')
+    unfold: bpy.props.BoolProperty(name='Unfold', default=False)
 
     @classmethod
     def poll(cls, context):
@@ -325,7 +335,15 @@ class Origamify(bpy.types.Operator):
 
     def execute(self, context):
         obj = context.active_object
-        origami(obj, breadthfirst=self.breadthfirst)
+        mesh, root, faces, st, parents = origami(obj, breadthfirst=self.breadthfirst)
+        if self.constrain_root:
+            root.constraints.new(type='LIMIT_ROTATION')
+            root.constraints['Limit Rotation'].use_limit_x = True
+            root.constraints['Limit Rotation'].min_x = 0
+            root.constraints['Limit Rotation'].max_x = 0
+
+        if self.unfold:
+            unfold_object(root, recursively=True)
 
         return {'FINISHED'}
 
