@@ -291,6 +291,7 @@ def animate(root, kind, direction, current_frame, frames_between, include_curren
         current_frame += frames_between
 
 class OrigamiUnfold(bpy.types.Operator):
+    """UnFold an origami object flat"""
     bl_idname = 'object.origiamiunfold'
     bl_label = 'Origami Unfold'
     bl_options = {'REGISTER', 'UNDO'}
@@ -306,6 +307,7 @@ class OrigamiUnfold(bpy.types.Operator):
         return {'FINISHED'}
 
 class OrigamiFold(bpy.types.Operator):
+    """Fold an origami object back to its original state"""
     bl_idname = 'object.origiamifold'
     bl_label = 'Origami Fold'
     bl_options = {'REGISTER', 'UNDO'}
@@ -321,6 +323,7 @@ class OrigamiFold(bpy.types.Operator):
         return {'FINISHED'}
 
 class Origamify(bpy.types.Operator):
+    """Create nested object from faces for unfolding"""
     bl_idname = 'object.origamify'
     bl_label = 'Origamify'
     bl_options = {'REGISTER', 'UNDO'}
@@ -348,6 +351,7 @@ class Origamify(bpy.types.Operator):
         return {'FINISHED'}
 
 class OrigamiAnimate(bpy.types.Operator):
+    """Animate the folding or unfolding of an origami object"""
     bl_idname = 'object.origamianimate'
     bl_label = 'Origami Animate'
     bl_options = {'REGISTER', 'UNDO'}
@@ -389,13 +393,29 @@ classes = [
     OrigamiAnimate,
 ]
 
+class OrigamiMenu(bpy.types.Menu):
+    bl_label = 'Origamify'
+    bl_idname = 'OBJECT_MT_origamify'
+
+    def draw(self, context):
+        for klass in classes:
+            self.layout.operator(klass.bl_idname)
+
+
+def menu_func(self, context):
+    self.layout.menu(OrigamiMenu.bl_idname)
+
 def register():
+    bpy.utils.register_class(OrigamiMenu)
     for klass in classes:
         bpy.utils.register_class(klass)
+    bpy.types.VIEW3D_MT_object.append(menu_func)
 
 def unregister():
+    bpy.utils.unregister_class(OrigamiMenu)
     for klass in classes:
         bpy.utils.unregister_class(klass)
+    bpy.types.VIEW3D_MT_object.remove(menu_func)
 
 if __name__ == '__dev__':
     # I have a script in a testing blendfile with the following two lines in it to run this script
@@ -411,8 +431,4 @@ if __name__ == '__dev__':
     dev()
 
 elif __name__ == '__main__':
-    try:
-        unregister()
-    except Exception:
-        pass
     register()
