@@ -3,3 +3,7 @@ Blender addon that takes a mesh object and creates a parent hierarchy of objects
 [Demo](https://youtu.be/28FP0Ip6860)
 
 Available in the menu Object>Orgamify or by operator search.
+
+## Installation
+
+Unzip and select the file `origami.py` when installing from Blender, not the `.zip` file.
