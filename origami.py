@@ -150,6 +150,7 @@ def origami(obj, breadthfirst=True):
         mesh_face = bmesh.new()
         f = mesh.faces[f_idx]
         mesh_face.faces.new([mesh_face.verts.new(x.co) for x in f.verts])
+        bmesh.ops.recalc_face_normals(mesh_face, faces=mesh_face.faces)
         faces[f_idx] = object_from_bmesh(f'{obj.name_full}face{f_idx:03d}', mesh_face)
 
     root = None
@@ -189,6 +190,28 @@ def origami(obj, breadthfirst=True):
         o['origami_dihedral_angle'] = dihedral
 
     assert root is not None
+
+    # fixup normals, still not sure why they are sometimes flipped
+    # BUG this isn't reliable, for the most part, the noraml is always inverted and needs flipping, but sometimes there is a false negative or two
+    for f_idx in parents:
+        face = mesh.faces[f_idx]
+        obj = faces[f_idx]
+
+        m = bmesh.new()
+        m.from_mesh(obj.data)
+        m.transform(obj.matrix_world)
+        bmesh.ops.recalc_face_normals(m, faces=m.faces)
+        m.faces.ensure_lookup_table()
+        assert len(m.faces) == 1
+        obj_face = m.faces[0]
+        # print(math.degrees(obj_face.normal.angle(face.normal)))
+        if not math.isclose(obj_face.normal.angle(face.normal), 0):
+            # we start with a fresh mesh, or we could invert the obj.matrix_world transform
+            m = bmesh.new()
+            m.from_mesh(obj.data)
+            for f in m.faces:
+                f.normal_flip()
+            m.to_mesh(obj.data)
 
     return mesh, root, faces, st, parents
 
