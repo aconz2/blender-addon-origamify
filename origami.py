@@ -131,6 +131,9 @@ def split_edges(name, mesh, spanning_tree):
 def face_vert_not_on_edge(face, edge):
     return next(iter(set(face.verts) - set(edge.verts)))
 
+def vector_rejection(a, b):
+    return a - a.project(b)
+
 def origami(obj, breadthfirst=True):
     mesh = bmesh.new()
     mesh.from_mesh(obj.data)
@@ -166,32 +169,14 @@ def origami(obj, breadthfirst=True):
         # setup the nex axis so Z is the face normal, Y points inwards along face, and X is ortho to both face normals
         # this makes it so that rotation in the positive X direction unfolds the face (makes it more like a flat sheet)
         dihedral = orig_face.normal.angle(parent_face.normal)
-        tol = 1e-6
-        if math.isclose(dihedral, 0, rel_tol=tol) or math.isclose(dihedral, math.pi, rel_tol=tol):  # usually happens with flat sheets
-            i = e.verts[0].co - e.verts[1].co
-            # take another point on this face and go up by the normal
-            v1 = face_vert_not_on_edge(orig_face, e).co + orig_face.normal
-            v2 = face_vert_not_on_edge(parent_face, e).co + orig_face.normal
-            # a vertex on the other face should get farther when we move in the positive x direction
-            d = (v1 - v2).length_squared
-            amount = 1
-            v2_pos = rotate_about_axis(i, math.radians(amount)) @ v2
-            v2_neg = rotate_about_axis(-i, math.radians(amount)) @ v2
-            d_pos = (v1 - v2_pos).length_squared
-            d_neg = (v1 - v2_neg).length_squared
-            # TODO this might not be numerically robust
-            if d_neg < d:
-                assert d_pos > d
-                pass  # i is fine
-            elif d_pos < d:
-                i *= -1
-            else:
-                raise Exception(d, d_pos, d_neg)
-        else:
-            i = orig_face.normal.cross(parent_face.normal)
 
-        j = -i.cross(orig_face.normal)
+        # j is a vector along the face, perpindicular to the hinge edge e
+        j = vector_rejection(
+            face_vert_not_on_edge(orig_face, e).co - e.verts[0].co,
+            e.verts[1].co - e.verts[0].co,
+        )
         k = orig_face.normal
+        i = -j.cross(k)
 
         new_origin = change_of_basis_matrix(midpoint, i, j, k)
         try:
