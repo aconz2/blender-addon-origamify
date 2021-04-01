@@ -1,4 +1,4 @@
-Blender addon that takes a mesh object and creates a parent hierarchy of objects, one for each face, where each object's local X axis lies along the edge it shares with its parent. Works on closed shapes by creating a [net](https://en.wikipedia.org/wiki/Net_(polyhedron) and kinda works on actual origami shapes.
+Blender addon that takes a mesh object and creates a parent hierarchy of objects, one for each face, where each object's local X axis lies along the edge it shares with its parent. Works on closed shapes by creating a [net](https://en.wikipedia.org/wiki/Net_(polyhedron)) and kinda works on actual origami shapes.
 
 Each object's local axis is aligned so that:
 
