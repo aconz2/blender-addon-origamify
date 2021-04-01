@@ -15,6 +15,11 @@ from queue import deque
 import random
 import itertools
 
+TOL = 1e-6
+
+def is_0_180(x, tol=TOL):
+    return math.isclose(x, 0, rel_tol=tol) or math.isclose(x, math.pi, rel_tol=tol)
+
 def rotate_about_axis(axis, theta):
     """
     rodrigues formula
@@ -162,22 +167,47 @@ def origami(obj, breadthfirst=True):
         o = faces[k]
         o.parent = faces[parent]
 
-        orig_face = mesh.faces[k]
+        orig_face   = mesh.faces[k]
         parent_face = mesh.faces[parent]
+
         e = mesh.edges[edge_idx]
         midpoint = (e.verts[0].co + e.verts[1].co) / 2
+        ev = e.verts[1].co - e.verts[0].co
 
-        # setup the nex axis so Z is the face normal, Y points inwards along face, and X is ortho to both face normals
-        # this makes it so that rotation in the positive X direction unfolds the face (makes it more like a flat sheet)
-        dihedral = orig_face.normal.angle(parent_face.normal)
+        # setup the new axis so Z is the face normal, Y points inwards along face, and X is ortho to both face normals
+        # this makes it so that rotation in the positive X direction rotates +Z according to the right hand rule (counter clockwise)
 
         # j is a vector along the face, perpindicular to the hinge edge e
-        j = vector_rejection(
-            face_vert_not_on_edge(orig_face, e).co - e.verts[0].co,
-            e.verts[1].co - e.verts[0].co,
-        )
+        j = vector_rejection(face_vert_not_on_edge(orig_face, e).co - e.verts[0].co, ev)
         k = orig_face.normal
-        i = -j.cross(k)
+        i = j.cross(k)
+
+        dihedral = orig_face.normal.angle(parent_face.normal)
+        assert 0 <= dihedral <= math.pi
+
+        # Y axis along the parent
+        j_parent = vector_rejection(face_vert_not_on_edge(parent_face, e).co - e.verts[0].co, ev)
+
+        # because face normals set the sign of rotation and we can have alternate normals between the two faces
+        # we check each sign and each rotation for the proper one
+        # the proper one is the one where rotating by it forms a straight line between the two j (Y) vectors
+        angles = [
+            dihedral,
+            -dihedral,
+            math.pi - dihedral,
+            -(math.pi - dihedral),
+        ]
+
+        dihedral_flatten_delta = None
+        for angle in angles:
+            jj = rotate_about_axis(i, angle) @ j
+            if math.isclose(j_parent.angle(jj), math.pi, rel_tol=TOL):
+                dihedral_flatten_delta = angle
+                new_dihedral = (rotate_about_axis(i, angle) @ k).angle(parent_face.normal)
+                assert is_0_180(new_dihedral)
+                break
+
+        assert dihedral_flatten_delta is not None
 
         new_origin = change_of_basis_matrix(midpoint, i, j, k)
         try:
@@ -187,7 +217,8 @@ def origami(obj, breadthfirst=True):
             print('WARNING matrix inversion failed')
 
         o['origami_original_angle'] = o.rotation_euler.x
-        o['origami_dihedral_angle'] = dihedral
+        o['origami_dihedral_angle'] = dihedral  # not used anymore but could still be useful
+        o['origami_unfold_angle'] = o.rotation_euler.x + dihedral_flatten_delta
 
     assert root is not None
 
@@ -204,7 +235,6 @@ def origami(obj, breadthfirst=True):
         m.faces.ensure_lookup_table()
         assert len(m.faces) == 1
         obj_face = m.faces[0]
-        # print(math.degrees(obj_face.normal.angle(face.normal)))
         if not math.isclose(obj_face.normal.angle(face.normal), 0):
             # we start with a fresh mesh, or we could invert the obj.matrix_world transform
             m = bmesh.new()
@@ -219,28 +249,31 @@ def dev():
     print('-' * 80)
     C = bpy.context
     D = bpy.data
-    # obj = D.objects['Cube']
-    # obj = D.objects['Icosphere']
-    obj = D.objects['Plane']
 
     for o in list(D.objects.keys()):
-        if o.startswith(f'{obj.name_full}face'):
+        if 'face' in o:
             D.objects.remove(D.objects[o], do_unlink=True)
 
-    mesh, root, faces, st, parents = origami(obj)
-    for f in faces.values():
-        f.show_axis = True
+    for name in ['Cube', 'Tetrahedron', 'AccordionCrinkled', 'AccordionCrinkledAlternating', 'Plane']:
+        obj = D.objects[name]
+        mesh, root, faces, st, parents = origami(obj)
+        for f in faces.values():
+            f.show_axis = True
+        unfold_object(root, recursively=True)
+        obj.hide_viewport = True
 
     # animate(root, 'ALL', 'UNFOLD', 0, 10, True)
 
-def unfold_object(obj, recursively=False):
-    angle = obj.get('origami_dihedral_angle')
+def unfold_object(obj, recursively=False, levels=-2):
+    if levels == -1:
+        return
+    angle = obj.get('origami_unfold_angle')
     if angle is not None:
-        obj.rotation_euler.x = obj.rotation_euler.x + angle
+        obj.rotation_euler.x = angle
 
     if recursively:
         for child in obj.children:
-            unfold_object(child, recursively)
+            unfold_object(child, recursively, levels - 1)
 
 def fold_object(obj, recursively=False):
     angle = obj.get('origami_original_angle')
