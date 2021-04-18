@@ -17,6 +17,11 @@ import itertools
 
 TOL = 1e-6
 
+class SpanningTreeMissingFaces(Exception):
+    def __init__(self, n_missing):
+        self.n_missing = n_missing
+        super().__init__()
+
 def is_0_180(x, tol=TOL):
     return math.isclose(x, 0, rel_tol=tol) or math.isclose(x, math.pi, rel_tol=tol)
 
@@ -44,26 +49,20 @@ def canonical_key(face1, edge, face2):
         return (face1, edge, face2)
     return (face2, edge, face1)
 
-def face_connectivity_graph(mesh):
+def face_connectivity_graph(obj, mesh, use_seams=False):
     """
     Returns a list of triples (face_idx0, edge_idx, face_idx1) which correspond to the linkage information
     face_idx0 < face_idx1 to dedup
     raises Exception if edge connects more than two faces
     """
-    mesh.faces.ensure_lookup_table()
-    mesh.edges.ensure_lookup_table()
+    ret = []
 
-    ret = set()
-    for face in mesh.faces:
-        for loop in face.loops:
-            faces = list(loop.edge.link_faces)
-            if len(faces) > 2:
-                raise Exception('Edges connect more than two faces')
-            if len(faces) == 2:
-                ret.add(canonical_key(faces[0].index, loop.edge.index, faces[1].index))
-            # ignore edges on boundaries if not a closed shape for instance
+    for edge in mesh.edges:
+        if use_seams and obj.data.edges[edge.index].use_seam or len(edge.link_faces) != 2:
+            continue
+        ret.append(canonical_key(edge.link_faces[0].index, edge.index, edge.link_faces[1].index))
 
-    return list(ret)
+    return ret
 
 def spanning_tree(edges, start=None, breadthfirst=False):
     """
@@ -93,12 +92,12 @@ def spanning_tree(edges, start=None, breadthfirst=False):
 
     if breadthfirst:
         # breadthfirst
-        take = lambda: q.popleft()
-        put = lambda x: q.append(x)
+        take = q.popleft
+        put = q.append
     else:
         # depthfirst
-        take = lambda: q.pop()
-        put = lambda x: q.append(x)
+        take = q.pop
+        put = q.append
 
     while q:
         cur = take()
@@ -134,20 +133,28 @@ def split_edges(name, mesh, spanning_tree):
     return object_from_bmesh(name, meshsplit)
 
 def face_vert_not_on_edge(face, edge):
-    return next(iter(set(face.verts) - set(edge.verts)))
+    # return next(iter(set(face.verts) - set(edge.verts)))
+    edge_verts = set(edge.verts)
+    for v in face.verts:
+        if v not in edge_verts:
+            return v
+
+    assert False
 
 def vector_rejection(a, b):
     return a - a.project(b)
 
-def origami(obj, breadthfirst=True):
+def origami(obj, breadthfirst=True, use_seams=False):
     mesh = bmesh.new()
     mesh.from_mesh(obj.data)
+    mesh.edges.ensure_lookup_table()
     mesh.faces.ensure_lookup_table()
 
-    g = face_connectivity_graph(mesh)
+    g = face_connectivity_graph(obj, mesh, use_seams=use_seams)
     start = mesh.faces.active.index if mesh.faces.active else None
     st, parents = spanning_tree(g, breadthfirst=breadthfirst, start=start)
     if len(parents) != len(mesh.faces):
+        raise SpanningTreeMissingFaces(len(mesh.faces) - len(parents))
         print('WARNING: spanning tree did not visit all faces, missing {}'.format(len(mesh.faces) - len(parents)))
 
     faces = {}
@@ -372,6 +379,7 @@ class Origamify(bpy.types.Operator):
     breadthfirst: bpy.props.BoolProperty(name='Breadthfirst', default=True)
     constrain_root: bpy.props.BoolProperty(name='Constrain Root', default=False, description='Add an X Limit Rotation Constraint to the root object to always be 0')
     unfold: bpy.props.BoolProperty(name='Unfold', default=False)
+    use_seams: bpy.props.BoolProperty(name='Use Seams', default=False, description='Respect marked seams by never hinging on them')
 
     @classmethod
     def poll(cls, context):
@@ -379,7 +387,12 @@ class Origamify(bpy.types.Operator):
 
     def execute(self, context):
         obj = context.active_object
-        mesh, root, faces, st, parents = origami(obj, breadthfirst=self.breadthfirst)
+        try:
+            mesh, root, faces, st, parents = origami(obj, breadthfirst=self.breadthfirst, use_seams=self.use_seams)
+        except SpanningTreeMissingFaces as e:
+            self.report({'ERROR'}, f'Spanning tree did not cover whole object, missing {e.n_missing} faces. Maybe you have too many seams')
+            return {'FINISHED'}
+
         if self.constrain_root:
             root.constraints.new(type='LIMIT_ROTATION')
             root.constraints['Limit Rotation'].use_limit_x = True

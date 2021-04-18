@@ -25,7 +25,9 @@ Objects that have been run through the `Origamify` command will have some custom
 
 Create the parent hierarchy from a selected mesh with the axes as explained above. You can control the root object by going into Edit Mode, selecting that face, back into Object Mode, and then running this command.
 
-The constrain root option inserts an X Limit Rotation with min and max angle of 0, which locks the X axis rotation for the parent. This is just a convenience because if you `Select Hierachy` and rotate all objects on their local X, things will be weird if you also rotate the root.
+The constrain root option inserts an X Limit Rotation on the root object with min and max angle of 0, which locks the X axis rotation for the parent. This is just a convenience because if you `Select Hierachy` and rotate all objects on their local X, things will be weird if you also rotate the root.
+
+The Use Seams option will prevent an edge that is marked as a seam from becoming a hinge edge.
 
 ### Origami Unfold
 
