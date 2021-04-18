@@ -17,9 +17,15 @@ Unzip and select the file `origami.py` when installing from Blender, not the `.z
 
 ## Commands
 
+To use the `Unfold`, `Fold`, and `Animate` commands, you need to first run the `Origamify` command on the object you're interested in. Each of the commands then operates on the created parent hierarchy (or some subset of it).
+
+Objects that have been run through the `Origamify` command will have some custom properties on them which start with `origami_`.
+
 ### Origamify
 
 Create the parent hierarchy from a selected mesh with the axes as explained above. You can control the root object by going into Edit Mode, selecting that face, back into Object Mode, and then running this command.
+
+The constrain root option inserts an X Limit Rotation with min and max angle of 0, which locks the X axis rotation for the parent. This is just a convenience because if you `Select Hierachy` and rotate all objects on their local X, things will be weird if you also rotate the root.
 
 ### Origami Unfold
 
@@ -35,7 +41,11 @@ Select just the object you want to animate and this descends recursively to inse
 
 ## Known Issues
 
-  - Some objects are created with a flipped normal. Cause unknown, but the axes created due respect the face normal from the original object
+  - Some objects are created with a flipped normal. Cause unknown, but the axes created do respect the face normal from the original object
+
+## Tips
+
+Because each object's local X axis is its "hinge" axis to its parent, it is very useful to select multiple objects you're interested in rotating, then holding `Alt` and dragging the `Rotation X` in `Object Properties` or holding `Alt` and clicking into `Rotation X` and entering a value.
 
 ## Notes
 
