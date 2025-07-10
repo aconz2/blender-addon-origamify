@@ -68,6 +68,7 @@ def spanning_tree(edges, start=None, breadthfirst=False):
     """
     Computes an arbitrary spanning tree from a list of triples (face_idx0, edge_idx, face_idx1)
     Returns a list which is a subset of the input
+    and a parents dict {face_idx: (parent_idx, edge_idx) | None} where parents[root] = None
     """
     # each edge only appears once
     assert len(set(e for _, e, _ in edges)) == len(edges)
@@ -144,7 +145,19 @@ def face_vert_not_on_edge(face, edge):
 def vector_rejection(a, b):
     return a - a.project(b)
 
-def origami(obj, breadthfirst=True, use_seams=False):
+def dedupe(xs, key):
+    d = {}
+    for x in xs:
+        k = key(x)
+        if k in d:
+            continue
+        d[k] = x
+    return list(d.values())
+
+def origami(obj, *, breadthfirst=True, use_seams=False, complete_graph=False):
+    """
+    complete_graph: insert shadow faces for those which aren't a member of the spanning tree
+    """
     mesh = bmesh.new()
     mesh.from_mesh(obj.data)
     mesh.edges.ensure_lookup_table()
@@ -155,23 +168,52 @@ def origami(obj, breadthfirst=True, use_seams=False):
     st, parents = spanning_tree(g, breadthfirst=breadthfirst, start=start)
     if len(parents) != len(mesh.faces):
         raise SpanningTreeMissingFaces(len(mesh.faces) - len(parents))
-        print('WARNING: spanning tree did not visit all faces, missing {}'.format(len(mesh.faces) - len(parents)))
+
+    not_in_st = dedupe(set(g) - set(st), lambda t: t[0])  # {(face_1, edge, face_2)}
 
     faces = {}
-    for f_idx in parents:
+    shadow_faces = {}
+
+    faces_to_make = ((f_idx, False) for f_idx in parents.keys())
+    if complete_graph:
+        faces_to_make = itertools.chain(
+                faces_to_make,
+                ((f, True) for (f, _, _) in not_in_st)
+                )
+
+    for f_idx, is_shadow in faces_to_make:
         mesh_face = bmesh.new()
         f = mesh.faces[f_idx]
         mesh_face.faces.new([mesh_face.verts.new(x.co) for x in f.verts])
         bmesh.ops.recalc_face_normals(mesh_face, faces=mesh_face.faces)
-        faces[f_idx] = object_from_bmesh(f'{obj.name_full}face{f_idx:03d}', mesh_face)
+        suffix = '_' if is_shadow else ''
+        o = object_from_bmesh(f'{obj.name_full}face{f_idx:03d}{suffix}', mesh_face)
+        if is_shadow:
+            o.hide_render = True
+            o.display_type = 'WIRE'
+            shadow_faces[f_idx] = o
+        else:
+            faces[f_idx] = o
+
+    parents_list = [(k, False, v) for k, v in parents.items()]
+
+    if complete_graph:
+        for f1, e, f2 in not_in_st:
+            parents_list.append((f1, True, (f2, e)))
 
     root = None
-    for k, v in parents.items():
+    for k, is_shadow, v in parents_list:
         if v is None:
             root = faces[k]
+            root['root'] = True
             continue
+
         parent, edge_idx = v
-        o = faces[k]
+
+        if is_shadow:
+            o = shadow_faces[k]
+        else:
+            o = faces[k]
         o.parent = faces[parent]
 
         orig_face   = mesh.faces[k]
@@ -226,11 +268,14 @@ def origami(obj, breadthfirst=True, use_seams=False):
         o['origami_original_angle'] = o.rotation_euler.x
         o['origami_dihedral_angle'] = dihedral  # not used anymore but could still be useful
         o['origami_unfold_angle'] = o.rotation_euler.x + dihedral_flatten_delta
+        if is_shadow:
+            o['shadow'] = True
 
     assert root is not None
 
     # fixup normals, still not sure why they are sometimes flipped
     # BUG this isn't reliable, for the most part, the noraml is always inverted and needs flipping, but sometimes there is a false negative or two
+    # TODO this doesn't fixup the normals of the shadow faces (though they aren't really meant to be rendered)
     for f_idx in parents:
         face = mesh.faces[f_idx]
         obj = faces[f_idx]
@@ -250,26 +295,7 @@ def origami(obj, breadthfirst=True, use_seams=False):
                 f.normal_flip()
             m.to_mesh(obj.data)
 
-    return mesh, root, faces, st, parents
-
-def dev():
-    print('-' * 80)
-    C = bpy.context
-    D = bpy.data
-
-    for o in list(D.objects.keys()):
-        if 'face' in o:
-            D.objects.remove(D.objects[o], do_unlink=True)
-
-    for name in ['Cube', 'Tetrahedron', 'AccordionCrinkled', 'AccordionCrinkledAlternating', 'Plane']:
-        obj = D.objects[name]
-        mesh, root, faces, st, parents = origami(obj)
-        for f in faces.values():
-            f.show_axis = True
-        unfold_object(root, recursively=True)
-        obj.hide_viewport = True
-
-    # animate(root, 'ALL', 'UNFOLD', 0, 10, True)
+    return mesh, root, faces, st, parents, g
 
 def unfold_object(obj, recursively=False, levels=-2):
     if levels == -1:
@@ -388,7 +414,7 @@ class Origamify(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
         try:
-            mesh, root, faces, st, parents = origami(obj, breadthfirst=self.breadthfirst, use_seams=self.use_seams)
+            mesh, root, faces, st, parents, g = origami(obj, breadthfirst=self.breadthfirst, use_seams=self.use_seams)
         except SpanningTreeMissingFaces as e:
             self.report({'ERROR'}, f'Spanning tree did not cover whole object, missing {e.n_missing} faces. Maybe you have too many seams')
             return {'FINISHED'}
@@ -470,6 +496,27 @@ def unregister():
     for klass in classes:
         bpy.utils.unregister_class(klass)
     bpy.types.VIEW3D_MT_object.remove(menu_func)
+
+def dev():
+    print('-' * 80)
+    C = bpy.context
+    D = bpy.data
+
+    for o in list(D.objects.keys()):
+        if 'face' in o:
+            D.objects.remove(D.objects[o], do_unlink=True)
+
+    #for name in ['Cube', 'Tetrahedron', 'AccordionCrinkled', 'AccordionCrinkledAlternating', 'Plane']:
+    for name in ['Plane']:
+        obj = D.objects[name]
+        mesh, root, faces, st, parents, g = origami(obj, complete_graph=True)
+        for f in faces.values():
+            f.show_axis = True
+        unfold_object(root, recursively=True)
+        obj.hide_viewport = True
+
+    # animate(root, 'ALL', 'UNFOLD', 0, 10, True)
+
 
 if __name__ == '__dev__':
     # I have a script in a testing blendfile with the following two lines in it to run this script
