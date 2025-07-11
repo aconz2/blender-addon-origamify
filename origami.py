@@ -433,13 +433,13 @@ def animate(root, kind, direction, current_frame, frames_between, include_curren
     f = unfold_object if direction == 'UNFOLD' else fold_object
     if include_current:
         for obj in itertools.chain.from_iterable(order):
-            obj.keyframe_insert(data_path='rotation_euler', frame=current_frame)
+            obj.keyframe_insert(data_path='rotation_euler', index=0, frame=current_frame)
         current_frame += frames_between
 
     for objs in order:
         for obj in objs:
             f(obj)
-            obj.keyframe_insert(data_path='rotation_euler', frame=current_frame)
+            obj.keyframe_insert(data_path='rotation_euler', index=0, frame=current_frame)
         current_frame += frames_between
 
 class OrigamiUnfold(bpy.types.Operator):
@@ -599,16 +599,27 @@ def dev():
         # root.constraints['Limit Rotation'].min_x = 0
         # root.constraints['Limit Rotation'].max_x = 0
 
-        for o in faces.values():
-            if o is not root:
-                o.rotation_euler.x = math.radians(45)
+        # for o in faces.values():
+        #     o.keyframe_insert(data_path='rotation_euler', frame=1)
 
-        opt_data = prepare_for_opt(root)
-        angles = opt(opt_data)
-        # print('angle diff', opt_data.x0 - angles)
+        target_angle = 40
+        frame_step = 2
+        n_frames = 10
+        angles = np.linspace(0, math.radians(target_angle), n_frames)
+        for i, angle in enumerate(angles):
+            for o in faces.values():
+                if o is not root:
+                    o.rotation_euler.x = angle
 
-        for fi, o in faces.items():
-            o.rotation_euler.x = angles[fi]
+            opt_data = prepare_for_opt(root)
+            angles = opt(opt_data)
+            # print('angle diff', opt_data.x0 - angles)
+
+            for fi, o in faces.items():
+                o.rotation_euler.x = angles[fi]
+
+            for o in faces.values():
+                o.keyframe_insert(data_path='rotation_euler', index=0, frame=i * frame_step + 1)
 
         # faces = {}
         # def go(cur):
