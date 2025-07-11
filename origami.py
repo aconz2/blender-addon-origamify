@@ -10,10 +10,17 @@ import bpy
 import bmesh
 from mathutils import Vector, Matrix, Euler
 import math
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from queue import deque
 import random
 import itertools
+import json
+
+# import sys
+# subprocess.run([sys.executable, '-m', 'pip', 'install', 'jax'])
+import numpy as np
+import jax
+import jax.scipy.optimize
 
 TOL = 1e-6
 
@@ -155,7 +162,6 @@ def origami(obj, breadthfirst=True, use_seams=False):
     st, parents = spanning_tree(g, breadthfirst=breadthfirst, start=start)
     if len(parents) != len(mesh.faces):
         raise SpanningTreeMissingFaces(len(mesh.faces) - len(parents))
-        print('WARNING: spanning tree did not visit all faces, missing {}'.format(len(mesh.faces) - len(parents)))
 
     faces = {}
     for f_idx in parents:
@@ -163,7 +169,9 @@ def origami(obj, breadthfirst=True, use_seams=False):
         f = mesh.faces[f_idx]
         mesh_face.faces.new([mesh_face.verts.new(x.co) for x in f.verts])
         bmesh.ops.recalc_face_normals(mesh_face, faces=mesh_face.faces)
-        faces[f_idx] = object_from_bmesh(f'{obj.name_full}face{f_idx:03d}', mesh_face)
+        o = object_from_bmesh(f'{obj.name_full}face{f_idx:03d}', mesh_face)
+        o['face'] = f_idx
+        faces[f_idx] = o
 
     root = None
     for k, v in parents.items():
@@ -172,7 +180,6 @@ def origami(obj, breadthfirst=True, use_seams=False):
             continue
         parent, edge_idx = v
         o = faces[k]
-        o.parent = faces[parent]
 
         orig_face   = mesh.faces[k]
         parent_face = mesh.faces[parent]
@@ -190,7 +197,7 @@ def origami(obj, breadthfirst=True, use_seams=False):
         i = j.cross(k)
 
         dihedral = orig_face.normal.angle(parent_face.normal)
-        assert 0 <= dihedral <= math.pi
+        assert -TOL <= dihedral <= math.pi + TOL, f'got dihedral {dihedral:.6f}'
 
         # Y axis along the parent
         j_parent = vector_rejection(face_vert_not_on_edge(parent_face, e).co - e.verts[0].co, ev)
@@ -216,18 +223,43 @@ def origami(obj, breadthfirst=True, use_seams=False):
 
         assert dihedral_flatten_delta is not None
 
+        # NOTE the ordering of setting parent then transforming and setting matrix_world matters
+        o.parent = faces[parent]
+
         new_origin = change_of_basis_matrix(midpoint, i, j, k)
-        try:
-            o.data.transform(new_origin.inverted())
-            o.matrix_world = o.matrix_world @ new_origin
-        except ValueError:
-            print('WARNING matrix inversion failed')
+        o.data.transform(new_origin.inverted())
+        # NOTE I don't really understand why this is matrix_world and not matrix_local
+        o.matrix_world = new_origin
 
         o['origami_original_angle'] = o.rotation_euler.x
         o['origami_dihedral_angle'] = dihedral  # not used anymore but could still be useful
         o['origami_unfold_angle'] = o.rotation_euler.x + dihedral_flatten_delta
 
     assert root is not None
+
+    # record the edges that were not present in the spanning tree. these are edges that are "cut"
+    # each correspondence stores 6 indices. The first two reference the faces that this edge was connecting
+    # The next two give the index of the face's vertex of the first edge vertex and likewise for the second
+    # so (f1, f2, f1v1, f2v1, f1v2, f2v2) where after transformation we expect
+    #   faces[f1].verts[f1v1].co == faces[f2].verts[f2v1].co
+    #   faces[f1].verts[f1v2].co == faces[f2].verts[f2v2].co
+    correspondence = []
+    for f1_idx, e_idx, f2_idx in set(g) - set(st):
+        f1_vert_indices = [x.index for x in mesh.faces[f1_idx].verts]
+        f2_vert_indices = [x.index for x in mesh.faces[f2_idx].verts]
+        e = mesh.edges[e_idx]
+        v1_idx = e.verts[0].index
+        v2_idx = e.verts[1].index
+        correspondence.append([
+            f1_idx,
+            f2_idx,
+            f1_vert_indices.index(v1_idx),
+            f2_vert_indices.index(v1_idx),
+            f1_vert_indices.index(v2_idx),
+            f2_vert_indices.index(v2_idx)
+        ])
+
+    root['correspondence'] = json.dumps(correspondence, separators=(',', ':'))
 
     # fixup normals, still not sure why they are sometimes flipped
     # BUG this isn't reliable, for the most part, the noraml is always inverted and needs flipping, but sometimes there is a false negative or two
@@ -250,26 +282,98 @@ def origami(obj, breadthfirst=True, use_seams=False):
                 f.normal_flip()
             m.to_mesh(obj.data)
 
-    return mesh, root, faces, st, parents
+    return mesh, root, faces, st, parents, g
 
-def dev():
-    print('-' * 80)
-    C = bpy.context
-    D = bpy.data
+OptData = namedtuple('OptData', ['verts', 'mats', 'children', 'correspondence', 'root', 'x0'])
 
-    for o in list(D.objects.keys()):
-        if 'face' in o:
-            D.objects.remove(D.objects[o], do_unlink=True)
+def d_to_arr(d):
+    arr = np.zeros(len(d))
+    for k, v in d.items():
+        arr[k] = v
+    return arr
 
-    for name in ['Cube', 'Tetrahedron', 'AccordionCrinkled', 'AccordionCrinkledAlternating', 'Plane']:
-        obj = D.objects[name]
-        mesh, root, faces, st, parents = origami(obj)
-        for f in faces.values():
-            f.show_axis = True
-        unfold_object(root, recursively=True)
-        obj.hide_viewport = True
+def to4(x):
+    return [x[0], x[1], x[2], 1]
 
-    # animate(root, 'ALL', 'UNFOLD', 0, 10, True)
+def prepare_for_opt(root):
+    verts = {}
+    mats = {}
+    children = {}
+    x0 = {}
+
+    def go(cur):
+        face = cur['face']
+
+        mesh = bmesh.new()
+        mesh.from_mesh(cur.data)
+
+        # TODO if there is more than one face in this mesh then the indices are probably
+        # not going to match up with the correspondence
+        verts[face] = np.array([to4(v.co) for v in mesh.verts])
+        mats[face] = np.array(cur.matrix_local)
+        x0[face] = cur.rotation_euler.x
+
+        children[face] = list(map(go, cur.children))
+
+        return face
+
+    correspondence = json.loads(root['correspondence'])
+    go(root)
+    return OptData(
+        verts=verts,
+        mats=mats,
+        children=children,
+        correspondence=correspondence,
+        root=root['face'],
+        x0=d_to_arr(x0),
+    )
+
+# TODO if i not in angles, cut short
+def apply_rotations(opt_data, angles):
+    import jax.numpy as np
+    verts = {}
+    def go(i, mat):
+        angle = angles[i]
+        cos = np.cos(angle)
+        sin = np.sin(angle)
+        rot = np.array([
+            [1, 0, 0, 0],
+            [0, cos, -sin, 0],
+            [0, sin, cos, 0],
+            [0, 0, 0, 1],
+            ])
+        mat = mat @ opt_data.mats[i] @ rot
+        verts[i] = opt_data.verts[i] @ mat.T
+        for child in opt_data.children[i]:
+            go(child, mat)
+
+    go(opt_data.root, np.eye(4))
+
+    return verts
+
+def opt_objective(x, opt_data, log=False):
+    verts = apply_rotations(opt_data, x)
+    loss = 0
+    for f1, f2, f1v1, f2v1, f1v2, f2v2 in opt_data.correspondence:
+        if log:
+            print('d1', ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum())
+            print('d2', ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum())
+        loss += ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum()
+        loss += ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum()
+
+    return loss
+
+def opt(opt_data):
+    results = jax.scipy.optimize.minimize(
+            opt_objective,
+            args=(opt_data,),
+            x0=opt_data.x0,
+            method='BFGS',
+            )
+    print(opt_data.correspondence)
+    print('loss', opt_objective(results.x, opt_data, log=True))
+    print(results)
+    return results.x
 
 def unfold_object(obj, recursively=False, levels=-2):
     if levels == -1:
@@ -388,7 +492,7 @@ class Origamify(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
         try:
-            mesh, root, faces, st, parents = origami(obj, breadthfirst=self.breadthfirst, use_seams=self.use_seams)
+            mesh, root, faces, st, parents, g = origami(obj, breadthfirst=self.breadthfirst, use_seams=self.use_seams)
         except SpanningTreeMissingFaces as e:
             self.report({'ERROR'}, f'Spanning tree did not cover whole object, missing {e.n_missing} faces. Maybe you have too many seams')
             return {'FINISHED'}
@@ -470,6 +574,91 @@ def unregister():
     for klass in classes:
         bpy.utils.unregister_class(klass)
     bpy.types.VIEW3D_MT_object.remove(menu_func)
+
+def dev():
+    print('-' * 80)
+    C = bpy.context
+    D = bpy.data
+
+    for o in list(D.objects.keys()):
+        #if 'face' in o:
+        if 'face' in o or 'Empty' in o:
+            D.objects.remove(D.objects[o], do_unlink=True)
+
+    #for name in ['Cube', 'Tetrahedron', 'AccordionCrinkled', 'AccordionCrinkledAlternating', 'Plane']:
+    for name in ['Plane']:
+    # for name in ['Plane2']:
+        obj = D.objects[name]
+        mesh, root, faces, st, parents, g = origami(obj)
+        # for f in faces.values():
+        #     f.show_axis = True
+        unfold_object(root, recursively=True)
+        obj.hide_viewport = True
+        # root.constraints.new(type='LIMIT_ROTATION')
+        # root.constraints['Limit Rotation'].use_limit_x = True
+        # root.constraints['Limit Rotation'].min_x = 0
+        # root.constraints['Limit Rotation'].max_x = 0
+
+        for o in faces.values():
+            if o is not root:
+                o.rotation_euler.x = math.radians(45)
+
+        opt_data = prepare_for_opt(root)
+        angles = opt(opt_data)
+        # print('angle diff', opt_data.x0 - angles)
+
+        for fi, o in faces.items():
+            o.rotation_euler.x = angles[fi]
+
+        # faces = {}
+        # def go(cur):
+        #     faces[cur['face']] = cur
+        #     for child in cur.children:
+        #         go(child)
+        # go(root)
+
+        # for o in faces.values():
+        #     o.hide_viewport = True
+
+        # test out apply_rotations
+        # to_rotate = np.ones(len(opt_data.verts)) * math.radians(45)
+        # to_rotate[root['face']] = 0
+        # verts = apply_rotations(opt_data, to_rotate)
+        # # verts = opt_data.verts
+        # mesh = bmesh.new()
+        # for i, vs in verts.items():
+        #     # print(vs)
+        #     mesh.faces.new([mesh.verts.new(x[:3]) for x in vs])
+        # o = object_from_bmesh('facecomputedangles', mesh)
+
+        # visualize the matrix_world/local translation piece
+        # for o in faces.values():
+        #     loc = o.matrix_world.translation
+        #     bpy.ops.object.empty_add(type='ARROWS')
+        #     empty = bpy.context.object
+        #     empty.name = 'Empty_local' + o.name
+        #     empty.location = loc
+
+        # visualize the verts in correspondence
+        # this forces matrix_world to be updated so we can figure out the correct positions
+        # bpy.context.view_layer.update()
+        # for f1, f2, f1v1, f2v1, f1v2, f2v2 in opt_data.correspondence:
+        #     for face, verts in [(f1, [f1v1, f1v2]), (f2, [f2v1, f2v2])]:
+        #         o = faces[face]
+        #         mesh = bmesh.new()
+        #         mesh.from_mesh(o.data)
+        #         mesh.verts.ensure_lookup_table()
+        #         mesh.transform(o.matrix_world)
+        #         for vert in verts:
+        #             loc = mesh.verts[vert].co
+        #             bpy.ops.object.empty_add(type='ARROWS')
+        #             empty = bpy.context.object
+        #             empty.name = f'Empty_face{face}_vert{vert}'
+        #             empty.location = loc
+
+
+    # animate(root, 'ALL', 'UNFOLD', 0, 10, True)
+
 
 if __name__ == '__dev__':
     # I have a script in a testing blendfile with the following two lines in it to run this script
