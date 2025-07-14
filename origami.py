@@ -18,6 +18,8 @@ import json
 
 # import sys
 # subprocess.run([sys.executable, '-m', 'pip', 'install', 'jax'])
+# or import pip
+# pip.main(['install', 'jax'])
 import numpy as np
 import jax
 import jax.scipy.optimize
@@ -29,7 +31,7 @@ class SpanningTreeMissingFaces(Exception):
         self.n_missing = n_missing
         super().__init__()
 
-OptData = namedtuple('OptData', ['verts', 'mats', 'children', 'correspondence', 'root', 'x0', 'fcurves'])
+OptData = namedtuple('OptData', ['verts', 'mats', 'children', 'correspondence', 'root', 'x0', 'fcurves', 'faces'])
 
 def is_0_180(x, tol=TOL):
     return math.isclose(x, 0, rel_tol=tol) or math.isclose(x, math.pi, rel_tol=tol)
@@ -238,6 +240,7 @@ def origami(obj, breadthfirst=True, use_seams=False):
         o['origami_unfold_angle'] = o.rotation_euler.x + dihedral_flatten_delta
 
     assert root is not None
+    root['root'] = True
 
     # record the edges that were not present in the spanning tree. these are edges that are "cut"
     # each correspondence stores 6 indices. The first two reference the faces that this edge was connecting
@@ -296,6 +299,7 @@ def to4(x):
     return [x[0], x[1], x[2], 1]
 
 def prepare_for_opt(root, get_fcurves=False):
+    faces = {}
     verts = {}
     mats = {}
     children = {}
@@ -310,6 +314,7 @@ def prepare_for_opt(root, get_fcurves=False):
 
         # TODO if there is more than one face in this mesh then the indices are probably
         # not going to match up with the correspondence
+        faces[face] = cur
         verts[face] = np.array([to4(v.co) for v in mesh.verts])
         mats[face] = np.array(cur.matrix_local)
         x0[face] = cur.rotation_euler.x
@@ -323,6 +328,7 @@ def prepare_for_opt(root, get_fcurves=False):
     correspondence = json.loads(root['correspondence'])
     go(root)
     return OptData(
+        faces=faces,
         verts=verts,
         mats=mats,
         children=children,
@@ -387,11 +393,11 @@ def snap_opt(opt_data, x0=None):
     print(results)
     return results.x
 
-def angles_at_i(opt_data, i):
-    d = {}
-    for face, fcurve in opt_data.fcurves.items():
-        d[face] = fcurve.keyframe_points[i].co
-    return d_to_arr(d)
+# def angles_at_i(opt_data, i):
+#     d = {}
+#     for face, fcurve in opt_data.fcurves.items():
+#         d[face] = fcurve.keyframe_points[i].co
+#     return d_to_arr(d)
 
 # returns (kp1, kp2) where each is an array [face, 2] where 2=(frame, angle)
 def angles_for_subdivision(opt_data, i=None):
@@ -589,11 +595,59 @@ class OrigamiAnimate(bpy.types.Operator):
 
         return {'FINISHED'}
 
+class OrigamiSnap(bpy.types.Operator):
+    """Snap an origami object so that its vertices align"""
+    bl_idname = 'object.origiamisnap'
+    bl_label = 'Origami Snap'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj.get('root', False):
+            self.report({'ERROR'}, 'Select a root object')
+        opt_data = prepare_for_opt(obj)
+        angles = snap_opt(opt_data)
+
+        for fi, o in opt_data.faces.items():
+            o.rotation_euler.x = angles[fi]
+        # for o in opt_data.faces.values():
+        #     o.keyframe_insert(data_path='rotation_euler', index=0)
+
+        return {'FINISHED'}
+
+class OrigamiSnapSubdivide(bpy.types.Operator):
+    """Insert keyframes to transition between two folded states"""
+    bl_idname = 'object.origiamisnapsubdivide'
+    bl_label = 'Origami Snap Subdivide'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    n: bpy.props.IntProperty(name='Number of Keyframes to insert', default=1, min=1)
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj.get('root', False):
+            self.report({'ERROR'}, 'Select a root object')
+
+        opt_data = prepare_for_opt(obj, get_fcurves=True)
+        subdivide_keyframes(opt_data, n=self.n)
+
+        return {'FINISHED'}
+
 classes = [
     Origamify,
     OrigamiUnfold,
     OrigamiFold,
     OrigamiAnimate,
+    OrigamiSnap,
+    OrigamiSnapSubdivide,
 ]
 
 class OrigamiMenu(bpy.types.Menu):
