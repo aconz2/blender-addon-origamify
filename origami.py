@@ -29,6 +29,8 @@ class SpanningTreeMissingFaces(Exception):
         self.n_missing = n_missing
         super().__init__()
 
+OptData = namedtuple('OptData', ['verts', 'mats', 'children', 'correspondence', 'root', 'x0', 'fcurves'])
+
 def is_0_180(x, tol=TOL):
     return math.isclose(x, 0, rel_tol=tol) or math.isclose(x, math.pi, rel_tol=tol)
 
@@ -284,22 +286,21 @@ def origami(obj, breadthfirst=True, use_seams=False):
 
     return mesh, root, faces, st, parents, g
 
-OptData = namedtuple('OptData', ['verts', 'mats', 'children', 'correspondence', 'root', 'x0'])
-
 def d_to_arr(d):
-    arr = np.zeros(len(d))
+    arr = [None] * len(d)
     for k, v in d.items():
         arr[k] = v
-    return arr
+    return np.array(arr)
 
 def to4(x):
     return [x[0], x[1], x[2], 1]
 
-def prepare_for_opt(root):
+def prepare_for_opt(root, get_fcurves=False):
     verts = {}
     mats = {}
     children = {}
     x0 = {}
+    fcurves = {}
 
     def go(cur):
         face = cur['face']
@@ -312,8 +313,10 @@ def prepare_for_opt(root):
         verts[face] = np.array([to4(v.co) for v in mesh.verts])
         mats[face] = np.array(cur.matrix_local)
         x0[face] = cur.rotation_euler.x
-
         children[face] = list(map(go, cur.children))
+        if get_fcurves:
+            # TODO: assumes the objects have a single action and the fcurve with rotation_euler[0]
+            fcurves[face] = cur.animation_data.action.fcurves.find('rotation_euler', index=0)
 
         return face
 
@@ -326,9 +329,12 @@ def prepare_for_opt(root):
         correspondence=correspondence,
         root=root['face'],
         x0=d_to_arr(x0),
+        fcurves=fcurves,
     )
 
-# TODO if i not in angles, cut short
+# TODO if i not in angles, cut short; though to do this properly we should figure out the LCA of the faces
+# involved in the correspondence and only apply rotations starting at the forest of those nodes
+# overall intention is that we might want to only change selected faces
 def apply_rotations(opt_data, angles):
     import jax.numpy as np
     verts = {}
@@ -351,29 +357,68 @@ def apply_rotations(opt_data, angles):
 
     return verts
 
-def opt_objective(x, opt_data, log=False):
+# minimize least squared distance between verts that should be coincident
+# x is the angle of each dihedral edge
+# another approach is to have an xtarget and also minimize ((x-xtarget)**2).sum()
+# but then we have to balance the two terms with a param
+def snap_opt_objective(x, opt_data, log=False):
     verts = apply_rotations(opt_data, x)
     loss = 0
     for f1, f2, f1v1, f2v1, f1v2, f2v2 in opt_data.correspondence:
+        l1 = ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum()
+        l2 = ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum()
         if log:
-            print('d1', ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum())
-            print('d2', ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum())
-        loss += ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum()
-        loss += ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum()
+            print('l1', l1)
+            print('l2', l2)
+        loss += l1 + l2
 
     return loss
 
-def opt(opt_data):
+def snap_opt(opt_data, x0=None):
+    x0 = opt_data.x0 if x0 is None else x0
     results = jax.scipy.optimize.minimize(
-            opt_objective,
+            snap_opt_objective,
             args=(opt_data,),
-            x0=opt_data.x0,
+            x0=x0,
             method='BFGS',
             )
     print(opt_data.correspondence)
-    print('loss', opt_objective(results.x, opt_data, log=True))
+    print('loss', snap_opt_objective(results.x, opt_data, log=True))
     print(results)
     return results.x
+
+def angles_at_i(opt_data, i):
+    d = {}
+    for face, fcurve in opt_data.fcurves.items():
+        d[face] = fcurve.keyframe_points[i].co
+    return d_to_arr(d)
+
+# returns (kp1, kp2) where each is an array [face, 2] where 2=(frame, angle)
+def angles_for_subdivision(opt_data, i=None):
+    d1 = {}
+    d2 = {}
+    for face, fcurve in opt_data.fcurves.items():
+        if i is None:
+            i_ = fcurve.keyframe_points.find(lambda x: x.select_control_point)
+        else:
+            i_ = i
+        d1[face] = fcurve.keyframe_points[i_].co
+        d2[face] = fcurve.keyframe_points[i_+1].co
+    return d_to_arr(d1), d_to_arr(d2)
+
+# I really wanted to instead have an opt_objective that would find a bezier spline for each face's angles
+# and minimize across the whole thing and regularize it so it would be the smoothest curve but is a bit
+# more complicated than I want to do right now
+def subdivide_keyframes(opt_data, n=1, i=None):
+    kp1, kp2 = angles_for_subdivision(opt_data, i=i)
+    # n=1 [1/2], n=2 [1/3, 2/3], n=3 [1/4, 2/4, 3/4]
+    ts = np.linspace(0, 1, n+1)[1:-1]
+    for t in ts:
+        kp = (1-t)*kp1 + t*kp2
+        angles = snap_opt(opt_data, x0=kp[:, 1])
+        for face, fcurve in opt_data.fcurves.items():
+            frame, _ = kp[face]
+            fcurve.keyframe_points.insert(frame, angles[face])
 
 def unfold_object(obj, recursively=False, levels=-2):
     if levels == -1:
@@ -602,24 +647,25 @@ def dev():
         # for o in faces.values():
         #     o.keyframe_insert(data_path='rotation_euler', frame=1)
 
-        target_angle = 40
-        frame_step = 2
-        n_frames = 10
-        angles = np.linspace(0, math.radians(target_angle), n_frames)
-        for i, angle in enumerate(angles):
+        angles = [(1, 0), (100, 40)]
+        for frame, angle in angles:
+            angle = math.radians(angle)
+
             for o in faces.values():
                 if o is not root:
                     o.rotation_euler.x = angle
 
             opt_data = prepare_for_opt(root)
-            angles = opt(opt_data)
-            # print('angle diff', opt_data.x0 - angles)
+            angles = snap_opt(opt_data)
 
             for fi, o in faces.items():
                 o.rotation_euler.x = angles[fi]
 
             for o in faces.values():
-                o.keyframe_insert(data_path='rotation_euler', index=0, frame=i * frame_step + 1)
+                o.keyframe_insert(data_path='rotation_euler', index=0, frame=frame)
+
+        opt_data = prepare_for_opt(root, get_fcurves=True)
+        subdivide_keyframes(opt_data, n=20, i=0)
 
         # faces = {}
         # def go(cur):
