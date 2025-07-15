@@ -293,12 +293,15 @@ def d_to_arr(d):
     arr = [None] * len(d)
     for k, v in d.items():
         arr[k] = v
-    return np.array(arr)
+    return np.array(arr, dtype=np.float32)
 
 def to4(x):
     return [x[0], x[1], x[2], 1]
 
 def prepare_for_opt(root, get_fcurves=False):
+    # NOTE need this so that running from script is equivalent to running from addon
+    bpy.context.view_layer.update()
+
     faces = {}
     verts = {}
     mats = {}
@@ -311,16 +314,19 @@ def prepare_for_opt(root, get_fcurves=False):
 
         mesh = bmesh.new()
         mesh.from_mesh(cur.data)
+        mesh.faces.ensure_lookup_table()
 
-        # TODO if there is more than one face in this mesh then the indices are probably
-        # not going to match up with the correspondence
         faces[face] = cur
         verts[face] = np.array([to4(v.co) for v in mesh.verts])
-        mats[face] = np.array(cur.matrix_local)
+        # TODO I don't understand why we undo the x rotation here. I got here because things worked okay
+        # when running from a script, but not from an addon. I traced this down to the matrix_local not being
+        # updated with the rotation_euler.x that was set when run from script. I thought it would be equiv to
+        # use the updated matrix_local but with x0=0 for all faces but that doesn't work either...
+        mats[face] = np.array(cur.matrix_local @ Matrix.Rotation(-cur.rotation_euler.x, 4, 'X'))
         x0[face] = cur.rotation_euler.x
         children[face] = list(map(go, cur.children))
         if get_fcurves:
-            # TODO: assumes the objects have a single action and the fcurve with rotation_euler[0]
+            # NOTE: assumes the objects have a single action and the fcurve with rotation_euler[0]
             fcurves[face] = cur.animation_data.action.fcurves.find('rotation_euler', index=0)
 
         return face
@@ -341,6 +347,8 @@ def prepare_for_opt(root, get_fcurves=False):
 # TODO if i not in angles, cut short; though to do this properly we should figure out the LCA of the faces
 # involved in the correspondence and only apply rotations starting at the forest of those nodes
 # overall intention is that we might want to only change selected faces
+# TODO I don't think we respect constraints here. for the root constraint, this is fine because the loss will be the same
+# for any root rotation, but if other faces have constraints, we won't respect them
 def apply_rotations(opt_data, angles):
     import jax.numpy as np
     verts = {}
@@ -359,7 +367,7 @@ def apply_rotations(opt_data, angles):
         for child in opt_data.children[i]:
             go(child, mat)
 
-    go(opt_data.root, np.eye(4))
+    go(opt_data.root, np.eye(4, dtype=np.float32))
 
     return verts
 
@@ -374,6 +382,10 @@ def snap_opt_objective(x, opt_data, log=False):
         l1 = ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum()
         l2 = ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum()
         if log:
+            # print(verts[f1].dtype, verts[f1])
+            # print(verts[f2].dtype, verts[f2])
+            # print('l1', l1, 'v1', verts[f1][f1v1], 'v2', verts[f2][f2v1])
+            # print('l2', l2, 'v2', verts[f1][f1v2], 'v2', verts[f2][f2v2])
             print('l1', l1)
             print('l2', l2)
         loss += l1 + l2
@@ -388,7 +400,7 @@ def snap_opt(opt_data, x0=None):
             x0=x0,
             method='BFGS',
             )
-    print(opt_data.correspondence)
+    # print(opt_data.correspondence)
     print('loss', snap_opt_objective(results.x, opt_data, log=True))
     print(results)
     return results.x
@@ -399,13 +411,19 @@ def snap_opt(opt_data, x0=None):
 #         d[face] = fcurve.keyframe_points[i].co
 #     return d_to_arr(d)
 
+def first_selected(keyframe_points):
+    for i, point in enumerate(keyframe_points):
+        if point.select_control_point:
+            return i
+    raise ValueError('No keyframe point selected')
+
 # returns (kp1, kp2) where each is an array [face, 2] where 2=(frame, angle)
 def angles_for_subdivision(opt_data, i=None):
     d1 = {}
     d2 = {}
     for face, fcurve in opt_data.fcurves.items():
         if i is None:
-            i_ = fcurve.keyframe_points.find(lambda x: x.select_control_point)
+            i_ = first_selected(fcurve.keyframe_points)
         else:
             i_ = i
         d1[face] = fcurve.keyframe_points[i_].co
@@ -418,7 +436,7 @@ def angles_for_subdivision(opt_data, i=None):
 def subdivide_keyframes(opt_data, n=1, i=None):
     kp1, kp2 = angles_for_subdivision(opt_data, i=i)
     # n=1 [1/2], n=2 [1/3, 2/3], n=3 [1/4, 2/4, 3/4]
-    ts = np.linspace(0, 1, n+1)[1:-1]
+    ts = np.linspace(0, 1, n+2)[1:-1]
     for t in ts:
         kp = (1-t)*kp1 + t*kp2
         angles = snap_opt(opt_data, x0=kp[:, 1])
@@ -601,21 +619,36 @@ class OrigamiSnap(bpy.types.Operator):
     bl_label = 'Origami Snap'
     bl_options = {'REGISTER', 'UNDO'}
 
+    insert_keyframes: bpy.props.BoolProperty(name='Insert Keyframes', default=False)
+
     @classmethod
     def poll(cls, context):
         return context.active_object is not None
 
     def execute(self, context):
         obj = context.active_object
+        print('root?', obj.get('root', False))
         if not obj.get('root', False):
             self.report({'ERROR'}, 'Select a root object')
+            return {'FINISHED'}
         opt_data = prepare_for_opt(obj)
         angles = snap_opt(opt_data)
 
         for fi, o in opt_data.faces.items():
+            print(o.name, math.degrees(angles[fi]))
             o.rotation_euler.x = angles[fi]
-        # for o in opt_data.faces.values():
-        #     o.keyframe_insert(data_path='rotation_euler', index=0)
+
+        # DEBUG
+        # for f1, f2, f1v1, f2v1, f1v2, f2v2 in opt_data.correspondence:
+        #     # opt_data.faces[f1].data.vertices[f1v1].select = True
+        #     opt_data.faces[f1].data.vertices[f1v2].select = True
+        #
+        #     # opt_data.faces[f2].data.vertices[f2v1].select = True
+        #     opt_data.faces[f2].data.vertices[f2v2].select = True
+
+        if self.insert_keyframes:
+            for o in opt_data.faces.values():
+                o.keyframe_insert(data_path='rotation_euler', index=0)
 
         return {'FINISHED'}
 
@@ -679,6 +712,14 @@ def dev():
     C = bpy.context
     D = bpy.data
 
+    # root = D.objects['Planeface003']
+    # opt_data = prepare_for_opt(root)
+    # angles = snap_opt(opt_data)
+    # for fi, o in opt_data.faces.items():
+    #     o.rotation_euler.x = angles[fi]
+    #
+    # return
+
     for o in list(D.objects.keys()):
         #if 'face' in o:
         if 'face' in o or 'Empty' in o:
@@ -693,33 +734,45 @@ def dev():
         #     f.show_axis = True
         unfold_object(root, recursively=True)
         obj.hide_viewport = True
-        # root.constraints.new(type='LIMIT_ROTATION')
-        # root.constraints['Limit Rotation'].use_limit_x = True
-        # root.constraints['Limit Rotation'].min_x = 0
-        # root.constraints['Limit Rotation'].max_x = 0
+        root.constraints.new(type='LIMIT_ROTATION')
+        root.constraints['Limit Rotation'].use_limit_x = True
+        root.constraints['Limit Rotation'].min_x = 0
+        root.constraints['Limit Rotation'].max_x = 0
 
         # for o in faces.values():
         #     o.keyframe_insert(data_path='rotation_euler', frame=1)
 
         angles = [(1, 0), (100, 40)]
+        # angles = [(100, 40)]
         for frame, angle in angles:
+            bpy.context.view_layer.update()
             angle = math.radians(angle)
 
             for o in faces.values():
-                if o is not root:
-                    o.rotation_euler.x = angle
+                # if o is not root:
+                #     o.rotation_euler.x = angle
+                o.rotation_euler.x = angle
 
             opt_data = prepare_for_opt(root)
+
+            # for face in opt_data.faces:
+            #     print(f'-- face {face} --')
+            #     print(opt_data.x0[face], opt_data2.x0[face])
+            #     print(opt_data2.mats[face])
+            #     print(opt_data.mats[face])
+            #     print(opt_data2.mats[face])
+            #     print()
+            #
             angles = snap_opt(opt_data)
 
-            for fi, o in faces.items():
+            for fi, o in opt_data.faces.items():
                 o.rotation_euler.x = angles[fi]
 
             for o in faces.values():
                 o.keyframe_insert(data_path='rotation_euler', index=0, frame=frame)
 
         opt_data = prepare_for_opt(root, get_fcurves=True)
-        subdivide_keyframes(opt_data, n=20, i=0)
+        subdivide_keyframes(opt_data, n=4, i=0)
 
         # faces = {}
         # def go(cur):
