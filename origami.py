@@ -414,7 +414,7 @@ class Origamify(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
         try:
-            mesh, root, faces, st, parents, g = origami(obj, breadthfirst=self.breadthfirst, use_seams=self.use_seams)
+            mesh, root, faces, st, parents, g = origami(obj, breadthfirst=self.breadthfirst, use_seams=self.use_seams, complete_graph=True)
         except SpanningTreeMissingFaces as e:
             self.report({'ERROR'}, f'Spanning tree did not cover whole object, missing {e.n_missing} faces. Maybe you have too many seams')
             return {'FINISHED'}
