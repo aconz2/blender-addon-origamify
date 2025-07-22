@@ -15,6 +15,17 @@ Available in the menu Object>Orgamify or by operator search.
 
 Unzip and select the file `origami.py` when installing from Blender, not the `.zip` file.
 
+Goto the scripting Python REPL in blender and run the following:
+
+```
+import sys, subprocess
+subprocess.run([sys.executable, '-m', 'pip', 'install', 'jax'])
+
+# or maybe try
+import pip
+pip.main(['install', 'jax'])
+```
+
 ## Commands
 
 To use the `Unfold`, `Fold`, and `Animate` commands, you need to first run the `Origamify` command on the object you're interested in. Each of the commands then operates on the created parent hierarchy (or some subset of it).
