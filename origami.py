@@ -627,7 +627,6 @@ class OrigamiSnap(bpy.types.Operator):
 
     def execute(self, context):
         obj = context.active_object
-        print('root?', obj.get('root', False))
         if not obj.get('root', False):
             self.report({'ERROR'}, 'Select a root object')
             return {'FINISHED'}
@@ -635,7 +634,6 @@ class OrigamiSnap(bpy.types.Operator):
         angles = snap_opt(opt_data)
 
         for fi, o in opt_data.faces.items():
-            print(o.name, math.degrees(angles[fi]))
             o.rotation_euler.x = angles[fi]
 
         # DEBUG
@@ -668,6 +666,7 @@ class OrigamiSnapSubdivide(bpy.types.Operator):
         obj = context.active_object
         if not obj.get('root', False):
             self.report({'ERROR'}, 'Select a root object')
+            return {'FINISHED'}
 
         opt_data = prepare_for_opt(obj, get_fcurves=True)
         subdivide_keyframes(opt_data, n=self.n)
