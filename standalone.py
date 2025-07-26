@@ -41,8 +41,8 @@ def arrto4(arr):
     ret[:, 3] = 1
     return ret
 
-def mat3to4(mat):
-    ret = np.zeros((4, 4))
+def mat3to4(mat, dtype=float):
+    ret = np.zeros((4, 4), dtype=dtype)
     ret[:3, :3] = mat
     ret[3, 3] = 1
     return ret
@@ -79,11 +79,10 @@ def r4z(angle, dtype=float):
 def normalized(v):
     return v / np.linalg.norm(v)
 
-def rotate_about_edge(v, rx):
-    rz = np.atan2(v[1], v[0])
-    return t4(v) @ r4z(-rz) @ r4x(rx) @ r4z(rz) @ t4(-v)
-    # return t4(-v) @ r4z(-rz) @ r4x(rx) @ r4z(rz) @ t4(v)
-    # return t4(v) @ r4z(rz) @ r4x(rx) @ r4z(-rz) @ t4(-v)
+# def rotate_about_edge(v, rx):
+#     rz = np.atan2(v[1], v[0])
+#     # return t4(v) @ r4z(-rz) @ r4x(rx) @ r4z(rz) @ t4(-v)
+#     return t4(-v) @ r4z(-rz) @ r4x(rx) @ r4z(rz) @ t4(v)
 
 def change_of_basis_matrix(at, i, j, k):
     rot = mat3to4(np.array([i, j, k]))
@@ -139,32 +138,55 @@ def spanning_tree(edges, start=None):
 
     return st, parents
 
-# these are the correcly pointing edge vectors that when rotated about positively, the face moves into +Z
+def face_vert_not_on_edge(edge, face):
+    for v in face:
+        if v not in edge:
+            return v
+    raise ValueError('no such edge')
+
+# def project(a, b):
+#     return np.dot(a, normalized(b))
+#
+# def vector_rejection(a, b):
+#     return a - project(a, b)
+
 def compute_matrices(parents, verts, edges, faces):
     ret_face_verts = {}
     ret_mat = {}
     verts4 = arrto4(verts)
     for fi, parent in parents.items():
         if parent is None:
+            ret_mat[fi] = np.eye(4, dtype=float)
             ret_face_verts[fi] = verts4[faces[fi]]
             continue
         parent_fi, ei = parent
         a, b = verts[edges[ei]]
-        face_verts = verts4[faces[fi]]
-        ev = a - b
         mid = (a + b) / 2
-        v2 = face_verts @ rotate_about_edge(ev, np.pi / 2).T
-        # the verts on the edge will stay at 0, but any other verts will get moved up or down
-        zsum = v2[:, 2].sum()
-        if zsum < 0:
-            ev = b - a
-        i = normalized(np.array([ev[0], ev[1], 0]))
         k = np.array([0, 0, 1])
-        j = np.cross(i, k)
-        cob = change_of_basis_matrix(mid, i, j, k)
-        cob_inv = np.linalg.inv(cob)
+        for i2 in a - b, b - a:
+            i = np.array([i2[0], i2[1], 0])
+            j = np.cross(i, k)
+            cob = change_of_basis_matrix(mid, i, j, k)
+            cob_inv = np.linalg.inv(cob)
+            v2 = verts4[faces[fi]] @ cob_inv.T @ r4x(np.pi / 2).T
+            zsum = v2[:, 2].sum()
+            if zsum > 0:
+                succ = True
+                break
+        assert succ
         ret_mat[fi] = cob
-        ret_face_verts[fi] = face_verts @ cob_inv.T
+        ret_face_verts[fi] = verts4[faces[fi]] @ cob_inv.T
+
+        # c = verts[face_vert_not_on_edge(edges[ei], faces[fi])]
+        # j = normalized(vector_rejection(c - a, a - b))
+        # mid = (a + b) / 2
+        # j = np.array([j[0], j[1], 0])
+        # k = np.array([0, 0, 1])
+        # i = np.cross(k, j)
+        # cob = change_of_basis_matrix(mid, i, j, k)
+        # cob_inv = np.linalg.inv(cob)
+        # ret_mat[fi] = cob
+        # ret_face_verts[fi] = verts4[faces[fi]] @ cob_inv.T
 
     return ret_mat, ret_face_verts
 
@@ -191,6 +213,14 @@ def prepare_opt_data(parents, cuts, verts, edges, faces, edge_vert_i, mats):
             faces[f2].index(v1),
             ))
 
+    # do a pass down the tree that accumulates the inverse
+    def go(i, mat):
+        mats[i] = np.linalg.inv(mat) @ mats[i]
+        mat = mat @ mats[i]
+        for child in children[i]:
+            go(child, mat)
+    go(root, np.eye(4))
+
     return OptData(
         verts = verts,
         faces = faces,
@@ -204,16 +234,18 @@ def apply_rotations(opt_data, angles):
     verts = {}
     def go(i, mat, depth=0):
         mat = mat @ opt_data.mats[i] @ r4x(angles[i])
+        # mat = r4x(angles[i]) @ mat @ opt_data.mats[i]
         verts[i] = opt_data.verts[i] @ mat.T
-        if depth == 0:
-            return
+        # if depth == 2:
+        #     return
         for child in opt_data.children[i]:
             go(child, mat, depth=depth+1)
             # break
 
     verts[opt_data.root] = opt_data.verts[opt_data.root]
     for child in opt_data.children[opt_data.root]:
-        go(child, np.eye(4, dtype=np.float32))
+        go(child, np.eye(4))
+
     return verts
 
 def get_angle(attr):
@@ -244,7 +276,7 @@ def plot(lines, angles, polygons, st):
         # plt.plot(x, y)
 
     for poly in polygons.geoms:
-        x, y = poly.buffer(-1).exterior.xy
+        x, y = poly.buffer(-0.01).exterior.xy
         axes[1].plot(x, y)
 
     for f1, _, f2 in st:
@@ -271,17 +303,21 @@ def plot3(faces, verts):
         zs.append(zs[0])
         ax.plot(xs, ys, zs)
 
+    ax.set_aspect('equal')
     plt.tight_layout()
     plt.savefig('/tmp/plot3.png')
+    # plt.show()
     plt.close()
 
 # file = 'miura-ori.svg'
 # file = 'test1.svg'
 file = 'flasher1.svg'
+# file = 'accordion.svg'
 paths, attributes = svg2paths(file)
 
 lines = []
 angles = []
+points = []
 for path, attr in zip(paths, attributes):
     angle = get_angle(attr)
     for part in path:
@@ -289,17 +325,35 @@ for path, attr in zip(paths, attributes):
             # flip y because svg +y goes down
             a = (part.start.real, -part.start.imag)
             b = (part.end.real, -part.end.imag)
-            lines.append(shapely.LineString([a, b]))
+            points.append(a)
+            points.append(b)
             angles.append(angle)
         else:
             raise Exception('unhandled path part', type(part))
 
-segments = shapely.unary_union(lines, grid_size=0.1).geoms
+points = np.array(points)
+xmin, xmax = points[:, 0].min(), points[:, 0].max()
+ymin, ymax = points[:, 1].min(), points[:, 1].max()
+points[:, 0] -= (xmax + xmin) / 2
+points[:, 1] -= (ymax + ymin) / 2
+
+# center and make from -1 to 1
+xspan = (xmax - xmin) / 2
+yspan = (ymax - ymin) / 2
+xmin, xmax = points[:, 0].min(), points[:, 0].max()
+ymin, ymax = points[:, 1].min(), points[:, 1].max()
+scale = 1 / max(xspan, yspan)
+points *= scale
+
+for a, b in zip(points[0::2], points[1::2]):
+    lines.append(shapely.LineString([a, b]))
+
+segments = shapely.unary_union(lines, grid_size=0.001).geoms
 tree = shapely.STRtree(segments)
 
 segment_angles = {}
 
-q = [line.buffer(0.1) for line in lines]
+q = [line.buffer(0.001) for line in lines]
 for line_i, segment_i in tree.query(q, predicate='contains').T:
     # print(line_i, segment_i)
     angle = angles[line_i]
@@ -375,9 +429,16 @@ print('cuts', cuts)
 mats, face_verts = compute_matrices(parents, verts, edges, faces)
 opt_data = prepare_opt_data(parents, cuts, face_verts, edges, faces, edge_vert_i, mats)
 
-# angles = np.ones(len(faces)) * np.radians(10)
-angles = np.ones(len(faces)) * np.radians(90)
+angles = np.ones(len(faces)) * np.radians(0)
 verts = apply_rotations(opt_data, angles)
-
+# for fi, vs in verts.items():
+#     print(fi)
+#     print(vs)
+#     print(vs)
+#     print()
+#
+# verts = {fi: v @ r4x(0).T @ t4(np.array([0, 1 * fi, 0])).T for fi, v in opt_data.verts.items()}
+# verts[opt_data.root] = opt_data.verts[opt_data.root]
+#
 plot(segments, segment_angles, polygons, st)
 plot3(faces, verts)
