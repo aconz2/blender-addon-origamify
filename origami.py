@@ -195,6 +195,7 @@ def origami(obj, breadthfirst=True, use_seams=False):
         # setup the new axis so Z is the face normal, Y points inwards along face, and X is ortho to both face normals
         # this makes it so that rotation in the positive X direction rotates +Z according to the right hand rule (counter clockwise)
 
+        # TODO face_vert_not_on_edge should actually check it is not colinear with ev (possible for quads)
         # j is a vector along the face, perpindicular to the hinge edge e
         j = vector_rejection(face_vert_not_on_edge(orig_face, e).co - e.verts[0].co, ev)
         k = orig_face.normal
