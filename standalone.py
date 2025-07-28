@@ -1,8 +1,13 @@
+from collections import defaultdict, deque, namedtuple
+
+from functools import partial
 from svgpathtools import svg2paths, Line
 import shapely
-from collections import defaultdict, deque, namedtuple
-import networkx as nx
+
 import numpy as np
+import jax.numpy as jnp
+import jax
+import jax.scipy.optimize
 
 # TODO there is a big compute reduction we can do by only calculating the position
 # of verts that are part of the cuts
@@ -22,11 +27,18 @@ angle_to_stroke = {
     0: '#000000',
 }
 
-# def d_to_arr(d):
-#     arr = [None] * len(d)
-#     for k, v in d.items():
-#         arr[k] = v
-#     return np.array(arr, dtype=np.float32)
+def d_to_arr(d):
+    arr = [None] * len(d)
+    for k, v in d.items():
+        arr[k] = v
+    return np.array(arr, dtype=np.float32)
+
+def d_to_list(d):
+    arr = [None] * len(d)
+    for k, v in d.items():
+        arr[k] = v
+    return arr
+
 def index_to_arr(d, dtype=np.float32):
     arr = [None] * len(d)
     for v, i in d.items():
@@ -57,34 +69,22 @@ def t4(v, dtype=float):
         ], dtype=dtype)
 
 def r4x(angle, dtype=float):
-    cos = np.cos(angle)
-    sin = np.sin(angle)
-    return np.array([
+    cos = jnp.cos(angle)
+    sin = jnp.sin(angle)
+    return jnp.array([
         [1, 0, 0, 0],
         [0, cos, -sin, 0],
         [0, sin, cos, 0],
         [0, 0, 0, 1],
         ], dtype=dtype)
 
-def r4z(angle, dtype=float):
-    cos = np.cos(angle)
-    sin = np.sin(angle)
-    return np.array([
-        [cos, -sin, 0, 0],
-        [sin, cos, 0, 0],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1],
-        ], dtype=dtype)
-
 def normalized(v):
     return v / np.linalg.norm(v)
 
-# def rotate_about_edge(v, rx):
-#     rz = np.atan2(v[1], v[0])
-#     # return t4(v) @ r4z(-rz) @ r4x(rx) @ r4z(rz) @ t4(-v)
-#     return t4(-v) @ r4z(-rz) @ r4x(rx) @ r4z(rz) @ t4(v)
-
 def change_of_basis_matrix(at, i, j, k):
+    # assert np.isclose(1, np.linalg.norm(i))
+    # assert np.isclose(1, np.linalg.norm(j))
+    # assert np.isclose(1, np.linalg.norm(k))
     rot = mat3to4(np.array([i, j, k]))
     return t4(at) @ rot.T
 
@@ -164,7 +164,7 @@ def compute_matrices(parents, verts, edges, faces):
         mid = (a + b) / 2
         k = np.array([0, 0, 1])
         for i2 in a - b, b - a:
-            i = np.array([i2[0], i2[1], 0])
+            i = normalized(np.array([i2[0], i2[1], 0]))
             j = np.cross(i, k)
             cob = change_of_basis_matrix(mid, i, j, k)
             cob_inv = np.linalg.inv(cob)
@@ -208,8 +208,8 @@ def prepare_opt_data(parents, cuts, verts, edges, faces, edge_vert_i, mats):
         correspondence.append((
             f1, f2,
             faces[f1].index(v0),
-            faces[f1].index(v1),
             faces[f2].index(v0),
+            faces[f1].index(v1),
             faces[f2].index(v1),
             ))
 
@@ -222,7 +222,7 @@ def prepare_opt_data(parents, cuts, verts, edges, faces, edge_vert_i, mats):
     go(root, np.eye(4))
 
     return OptData(
-        verts = verts,
+        verts = d_to_list(verts),
         faces = faces,
         children = children,
         correspondence = correspondence,
@@ -230,23 +230,42 @@ def prepare_opt_data(parents, cuts, verts, edges, faces, edge_vert_i, mats):
         mats = mats,
     )
 
-def apply_rotations(opt_data, angles):
+def apply_rotations(opt_data, angles, maxdepth=None):
     verts = {}
-    def go(i, mat, depth=0):
+    def go(i, mat, depth=1):
         mat = mat @ opt_data.mats[i] @ r4x(angles[i])
-        # mat = r4x(angles[i]) @ mat @ opt_data.mats[i]
         verts[i] = opt_data.verts[i] @ mat.T
-        # if depth == 2:
-        #     return
+        if maxdepth is not None and depth == maxdepth:
+            return
         for child in opt_data.children[i]:
             go(child, mat, depth=depth+1)
-            # break
 
     verts[opt_data.root] = opt_data.verts[opt_data.root]
     for child in opt_data.children[opt_data.root]:
-        go(child, np.eye(4))
+        go(child, jnp.eye(4))
 
     return verts
+
+@jax.jit
+def snap_opt_objective(x, opt_data):
+    verts = apply_rotations(opt_data, x)
+    loss = 0
+    for f1, f2, f1v1, f2v1, f1v2, f2v2 in opt_data.correspondence:
+        l1 = ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum()
+        l2 = ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum()
+        loss += l1 + l2
+
+    return loss
+
+def snap_opt(opt_data, x0=None):
+    x0 = np.zeros(len(opt_data.verts)) if x0 is None else x0
+    results = jax.scipy.optimize.minimize(
+            snap_opt_objective,
+            args=(opt_data,),
+            x0=x0,
+            method='BFGS',
+            )
+    return results
 
 def get_angle(attr):
     if 'style' in attr:
@@ -308,6 +327,12 @@ def plot3(faces, verts):
     plt.savefig('/tmp/plot3.png')
     # plt.show()
     plt.close()
+
+def total_vert_lengths(verts):
+    s = 0
+    for vs in verts.values():
+        s += np.linalg.norm(vs[1:] - vs[:-1], axis=1).sum()
+    return s
 
 # file = 'miura-ori.svg'
 # file = 'test1.svg'
@@ -429,16 +454,18 @@ print('cuts', cuts)
 mats, face_verts = compute_matrices(parents, verts, edges, faces)
 opt_data = prepare_opt_data(parents, cuts, face_verts, edges, faces, edge_vert_i, mats)
 
-angles = np.ones(len(faces)) * np.radians(0)
+# angles = np.ones(len(faces)) * np.radians(0)
+# verts = apply_rotations(opt_data, angles)
+
+x0 = np.radians(d_to_arr(segment_angles)) * 0.5
+import time
+t0 = time.time()
+results = snap_opt(opt_data, x0=x0)
+t1 = time.time()
+angles = results.x
+print('loss', results.fun)
+print('took', t1 - t0)
 verts = apply_rotations(opt_data, angles)
-# for fi, vs in verts.items():
-#     print(fi)
-#     print(vs)
-#     print(vs)
-#     print()
-#
-# verts = {fi: v @ r4x(0).T @ t4(np.array([0, 1 * fi, 0])).T for fi, v in opt_data.verts.items()}
-# verts[opt_data.root] = opt_data.verts[opt_data.root]
-#
+
 plot(segments, segment_angles, polygons, st)
 plot3(faces, verts)
