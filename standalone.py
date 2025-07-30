@@ -1,8 +1,10 @@
 from collections import defaultdict, deque, namedtuple
+from typing import List, Tuple, Dict
 
 from functools import partial
 from svgpathtools import svg2paths, Line
 import shapely
+from dataclasses import dataclass
 
 import numpy as np
 import jax.numpy as jnp
@@ -12,7 +14,40 @@ import jax.scipy.optimize
 # TODO there is a big compute reduction we can do by only calculating the position
 # of verts that are part of the cuts
 
-OptData = namedtuple('OptData', ['verts', 'faces', 'children', 'correspondence', 'root', 'mats'])
+# V' refers to the total number of duplicated vertices
+
+
+@dataclass
+class Mesh:
+    root: int
+    verts: np.ndarray # (V, 2) float
+    edges: np.ndarray # (E, 2) int
+    faces_idx: np.ndarray # (F, 2) int: (offset, n) into faces_packed
+    faces_packed: np.ndarray # (V') int: index into verts
+    spanning_tree: List[Tuple[int, int, int]]  # [(f1, ei, f2)]
+    cuts: List[Tuple[int, int, int]]  # [(f1, ei, f2)]
+    parents: Dict[int, Tuple[int, int]] # {fi: (parent, edge) | None}
+    children: Dict[int, List[int]]
+    segment_angles: Dict[int, float]  # degrees mapping from original segments
+    face_angles: np.ndarray # (F) # radians, angle of a face
+
+    # returns indices
+    def verts_for_face(self, fi):
+        offset, n = self.faces_idx[fi]
+        return self.faces_packed[offset:offset+n]
+
+@dataclass
+class OptData:
+    verts_idx: np.ndarray # (V', 2): (offset, n) into verts_packed
+    verts_packed: np.ndarray # (V', 4) float
+    mesh: Mesh
+    mats: np.ndarray # (F, 4, 4) float
+    correspondence: List[Tuple[int, int, int, int, int, int]]  # [(f1, f2, f1v1, f2v1, f1v2, f2v2)]
+
+    # returns f4 coordinates
+    def verts_for_face(self, fi):
+        offset, n = self.verts_idx[fi]
+        return self.verts_packed[offset:offset+n]
 
 stroke_to_angle = {
     '#ff0000': 180,
@@ -27,11 +62,11 @@ angle_to_stroke = {
     0: '#000000',
 }
 
-def d_to_arr(d):
+def d_to_arr(d, dtype=np.float32):
     arr = [None] * len(d)
     for k, v in d.items():
         arr[k] = v
-    return np.array(arr, dtype=np.float32)
+    return np.array(arr, dtype=dtype)
 
 def d_to_list(d):
     arr = [None] * len(d)
@@ -46,20 +81,20 @@ def index_to_arr(d, dtype=np.float32):
     return np.array(arr, dtype=dtype)
 
 # for hom
-def arrto4(arr):
+def arrto4(arr, dtype=np.float32):
     n, d = arr.shape
-    ret = np.zeros((n, 4))
+    ret = np.zeros((n, 4), dtype=dtype)
     ret[:, :d] = arr
     ret[:, 3] = 1
     return ret
 
-def mat3to4(mat, dtype=float):
+def mat3to4(mat, dtype=np.float32):
     ret = np.zeros((4, 4), dtype=dtype)
     ret[:3, :3] = mat
     ret[3, 3] = 1
     return ret
 
-def t4(v, dtype=float):
+def t4(v, dtype=np.float32):
     z = v[2] if len(v) == 3 else 0
     return np.array([
         [1, 0, 0, v[0]],
@@ -68,7 +103,7 @@ def t4(v, dtype=float):
         [0, 0, 0, 1],
         ], dtype=dtype)
 
-def r4x(angle, dtype=float):
+def r4x(angle, dtype=np.float32):
     cos = jnp.cos(angle)
     sin = jnp.sin(angle)
     return jnp.array([
@@ -144,23 +179,17 @@ def face_vert_not_on_edge(edge, face):
             return v
     raise ValueError('no such edge')
 
-# def project(a, b):
-#     return np.dot(a, normalized(b))
-#
-# def vector_rejection(a, b):
-#     return a - project(a, b)
-
-def compute_matrices(parents, verts, edges, faces):
+def compute_matrices(mesh):
     ret_face_verts = {}
     ret_mat = {}
-    verts4 = arrto4(verts)
-    for fi, parent in parents.items():
+    verts4 = arrto4(mesh.verts)
+    for fi, parent in mesh.parents.items():
         if parent is None:
-            ret_mat[fi] = np.eye(4, dtype=float)
-            ret_face_verts[fi] = verts4[faces[fi]]
+            ret_mat[fi] = np.eye(4, dtype=np.float32)
+            ret_face_verts[fi] = verts4[mesh.verts_for_face(fi)]
             continue
         parent_fi, ei = parent
-        a, b = verts[edges[ei]]
+        a, b = mesh.verts[mesh.edges[ei]]
         mid = (a + b) / 2
         k = np.array([0, 0, 1])
         for i2 in a - b, b - a:
@@ -168,29 +197,18 @@ def compute_matrices(parents, verts, edges, faces):
             j = np.cross(i, k)
             cob = change_of_basis_matrix(mid, i, j, k)
             cob_inv = np.linalg.inv(cob)
-            v2 = verts4[faces[fi]] @ cob_inv.T @ r4x(np.pi / 2).T
+            v2 = verts4[mesh.verts_for_face(fi)] @ cob_inv.T @ r4x(np.pi / 2).T
             zsum = v2[:, 2].sum()
             if zsum > 0:
                 succ = True
                 break
         assert succ
         ret_mat[fi] = cob
-        ret_face_verts[fi] = verts4[faces[fi]] @ cob_inv.T
-
-        # c = verts[face_vert_not_on_edge(edges[ei], faces[fi])]
-        # j = normalized(vector_rejection(c - a, a - b))
-        # mid = (a + b) / 2
-        # j = np.array([j[0], j[1], 0])
-        # k = np.array([0, 0, 1])
-        # i = np.cross(k, j)
-        # cob = change_of_basis_matrix(mid, i, j, k)
-        # cob_inv = np.linalg.inv(cob)
-        # ret_mat[fi] = cob
-        # ret_face_verts[fi] = verts4[faces[fi]] @ cob_inv.T
+        ret_face_verts[fi] = verts4[mesh.verts_for_face(fi)] @ cob_inv.T
 
     return ret_mat, ret_face_verts
 
-def prepare_opt_data(parents, cuts, verts, edges, faces, edge_vert_i, mats):
+def parents_to_children(parents):
     children = defaultdict(list)
     root = None
     for fi, parent in parents.items():
@@ -199,54 +217,64 @@ def prepare_opt_data(parents, cuts, verts, edges, faces, edge_vert_i, mats):
             continue
         parent_fi, ei = parent
         children[parent_fi].append(fi)
+    return children
 
-    assert root is not None
+def prepare_opt_data(mesh, face_verts, mats):
+    verts_idx = []
+    verts_packed = []
+    for vs in d_to_list(face_verts):
+        verts_idx.append((len(verts_packed), len(vs)))
+        verts_packed.extend(vs)
+    verts_idx = np.array(verts_idx)
+    verts_packed = np.array(verts_packed)
 
     correspondence = []
-    for f1, ei, f2 in cuts:
-        v0, v1 = edge_vert_i[ei]
+    for f1, ei, f2 in mesh.cuts:
+        v0, v1 = mesh.edges[ei]
         correspondence.append((
             f1, f2,
-            faces[f1].index(v0),
-            faces[f2].index(v0),
-            faces[f1].index(v1),
-            faces[f2].index(v1),
+            np.argmax(mesh.verts[mesh.verts_for_face(f1)] == v0),
+            np.argmax(mesh.verts[mesh.verts_for_face(f2)] == v0),
+            np.argmax(mesh.verts[mesh.verts_for_face(f1)] == v1),
+            np.argmax(mesh.verts[mesh.verts_for_face(f2)] == v1),
             ))
 
     # do a pass down the tree that accumulates the inverse
     def go(i, mat):
         mats[i] = np.linalg.inv(mat) @ mats[i]
         mat = mat @ mats[i]
-        for child in children[i]:
+        for child in mesh.children[i]:
             go(child, mat)
-    go(root, np.eye(4))
+    go(mesh.root, np.eye(4))
+
+    mats = np.array(d_to_list(mats))
 
     return OptData(
-        verts = d_to_list(verts),
-        faces = faces,
-        children = children,
-        correspondence = correspondence,
-        root = root,
-        mats = mats,
+        mesh=mesh,
+        verts_idx=verts_idx,
+        verts_packed=verts_packed,
+        correspondence=correspondence,
+        mats=mats,
     )
 
 def apply_rotations(opt_data, angles, maxdepth=None):
     verts = {}
     def go(i, mat, depth=1):
         mat = mat @ opt_data.mats[i] @ r4x(angles[i])
-        verts[i] = opt_data.verts[i] @ mat.T
+        verts[i] = opt_data.verts_for_face(i) @ mat.T
         if maxdepth is not None and depth == maxdepth:
             return
-        for child in opt_data.children[i]:
+        for child in opt_data.mesh.children[i]:
             go(child, mat, depth=depth+1)
 
-    verts[opt_data.root] = opt_data.verts[opt_data.root]
-    for child in opt_data.children[opt_data.root]:
+    verts[opt_data.mesh.root] = opt_data.verts_for_face(opt_data.mesh.root)
+    for child in opt_data.mesh.children[opt_data.mesh.root]:
         go(child, jnp.eye(4))
 
     return verts
 
-@jax.jit
+#@jax.jit
+#@jax.jit
 def snap_opt_objective(x, opt_data):
     verts = apply_rotations(opt_data, x)
     loss = 0
@@ -258,7 +286,7 @@ def snap_opt_objective(x, opt_data):
     return loss
 
 def snap_opt(opt_data, x0=None):
-    x0 = np.zeros(len(opt_data.verts)) if x0 is None else x0
+    x0 = np.zeros(len(opt_data.verts), dtype=np.float32) if x0 is None else x0
     results = jax.scipy.optimize.minimize(
             snap_opt_objective,
             args=(opt_data,),
@@ -334,138 +362,167 @@ def total_vert_lengths(verts):
         s += np.linalg.norm(vs[1:] - vs[:-1], axis=1).sum()
     return s
 
+def parse_svg(filename):
+    paths, attributes = svg2paths(filename)
+
+    angles = []
+    points = []
+    for path, attr in zip(paths, attributes):
+        angle = get_angle(attr)
+        for part in path:
+            if isinstance(part, Line):
+                # flip y because svg +y goes down
+                a = (part.start.real, -part.start.imag)
+                b = (part.end.real, -part.end.imag)
+                points.append(a)
+                points.append(b)
+                angles.append(angle)
+            else:
+                raise Exception('unhandled path part', type(part))
+
+    points = np.array(points)
+    xmin, xmax = points[:, 0].min(), points[:, 0].max()
+    ymin, ymax = points[:, 1].min(), points[:, 1].max()
+    # center and make from -1 to 1
+    points[:, 0] -= (xmax + xmin) / 2
+    points[:, 1] -= (ymax + ymin) / 2
+    xspan = (xmax - xmin) / 2
+    yspan = (ymax - ymin) / 2
+    scale = 1 / max(xspan, yspan)
+    points *= scale
+
+    lines = [shapely.LineString(ab) for ab in zip(points[0::2], points[1::2])]
+
+    # this chops up lines at intersections
+    segments = shapely.unary_union(lines, grid_size=0.001).geoms
+
+    # now need to recover the correspondence between segments and the original line
+    # so that we can get an angle per segment. we do this by buffering each line
+    # and checking "which line covers each segment"
+    tree = shapely.STRtree(segments)
+    q = [line.buffer(0.001) for line in lines]
+
+    segment_angles = {}
+    for line_i, segment_i in tree.query(q, predicate='contains').T:
+        angle = angles[line_i]
+        k = int(segment_i)
+        if int(segment_i) in segment_angles:
+            print(f'warn got double angle for {k}')
+        segment_angles[k] = angle
+
+    for i, segment in enumerate(segments):
+        angle = segment_angles.get(i)
+        if angle is None:
+            print(f"MISSING angle for segment {i}")
+
+
+    # turn lines into faces
+    polygons, cuts, dangles, invalid = shapely.polygonize_full(segments)
+    centroid_tree = shapely.STRtree([x.centroid for x in polygons.geoms])
+    central_poly = int(centroid_tree.query_nearest(polygons.centroid, all_matches=False)[0])
+
+    # print('cuts', cuts)
+    # print('dangles', dangles)
+    # print('invalid', invalid)
+
+    vert_index = {}  # {(x, y): i}
+    faces = []  # [[vi0, vi1, ...]]
+    edge_index = {}  # {(vi0, vi1): i}
+    edge_faces = defaultdict(list)  # {ei: [fi0, fi1]}
+
+    for f_i, polygon in enumerate(polygons.geoms):
+        x, y = polygon.exterior.xy
+        face_verts = []
+        for xy in zip(x, y):
+            if xy not in vert_index:
+                vert_index[xy] = len(vert_index)
+            face_verts.append(vert_index[xy])
+        # face_verts has verts like [0, 1, 2, 3, 0]
+        assert face_verts[0] == face_verts[-1]
+        n = len(face_verts)
+        for i in range(n - 1):
+            e = canonical_key2(face_verts[i], face_verts[i + 1])
+            if e not in edge_index:
+                edge_index[e] = len(edge_index)
+            ei = edge_index[e]
+            edge_faces[ei].append(f_i)
+
+        face_verts.pop() # remove duplicate vert at end
+        faces.append(face_verts)
+
+    verts = index_to_arr(vert_index, dtype=np.float32) # (V, 2)
+    edges = index_to_arr(edge_index, dtype=int)  # (E, 2)
+
+    # convert ragged face_verts [[vi0, vi1, vi2]] into
+    faces_packed = []
+    faces_idx = []
+    for fs in faces:
+        faces_idx.append((len(faces_packed), len(fs)))
+        faces_packed.extend(fs)
+
+    edge_faces_list = [] # [(f1, ei, f2)]
+    for ei, fis in edge_faces.items():
+        if len(fis) == 2:
+            f1, f2 = fis
+            edge_faces_list.append((f1, ei, f2))
+        elif len(fis) > 2:
+            print('wtf', ei, fis)
+
+    st, parents = spanning_tree(edge_faces_list, start=central_poly)
+    cuts = set(edge_faces_list) - set(st)
+
+    face_angles = np.zeros(len(faces), dtype=np.float32)
+    for fi, v in parents.items():
+        if v is None:
+            continue
+        _, ei = v
+        face_angles[fi] = segment_angles[ei]
+    face_angles = np.radians(face_angles)
+
+    return Mesh(
+        root=central_poly,
+        verts=verts,
+        edges=edges,
+        faces_idx=np.array(faces_idx),
+        faces_packed=np.array(faces_packed),
+        spanning_tree=st,
+        parents=parents,
+        children=parents_to_children(parents),
+        cuts=cuts,
+        segment_angles=segment_angles,
+        face_angles=face_angles,
+        )
+
 # file = 'miura-ori.svg'
 # file = 'test1.svg'
 file = 'flasher1.svg'
 # file = 'accordion.svg'
-paths, attributes = svg2paths(file)
-
-lines = []
-angles = []
-points = []
-for path, attr in zip(paths, attributes):
-    angle = get_angle(attr)
-    for part in path:
-        if isinstance(part, Line):
-            # flip y because svg +y goes down
-            a = (part.start.real, -part.start.imag)
-            b = (part.end.real, -part.end.imag)
-            points.append(a)
-            points.append(b)
-            angles.append(angle)
-        else:
-            raise Exception('unhandled path part', type(part))
-
-points = np.array(points)
-xmin, xmax = points[:, 0].min(), points[:, 0].max()
-ymin, ymax = points[:, 1].min(), points[:, 1].max()
-points[:, 0] -= (xmax + xmin) / 2
-points[:, 1] -= (ymax + ymin) / 2
-
-# center and make from -1 to 1
-xspan = (xmax - xmin) / 2
-yspan = (ymax - ymin) / 2
-xmin, xmax = points[:, 0].min(), points[:, 0].max()
-ymin, ymax = points[:, 1].min(), points[:, 1].max()
-scale = 1 / max(xspan, yspan)
-points *= scale
-
-for a, b in zip(points[0::2], points[1::2]):
-    lines.append(shapely.LineString([a, b]))
-
-segments = shapely.unary_union(lines, grid_size=0.001).geoms
-tree = shapely.STRtree(segments)
-
-segment_angles = {}
-
-q = [line.buffer(0.001) for line in lines]
-for line_i, segment_i in tree.query(q, predicate='contains').T:
-    # print(line_i, segment_i)
-    angle = angles[line_i]
-    if int(segment_i) in segment_angles:
-        print('warn got double angle for {}'.format(int(segment_i)))
-    segment_angles[int(segment_i)] = angle
-    # print(f'sgement {segment_i} should have angle {angle}')
-
-for i, segment in enumerate(segments):
-    # print(segment)
-    angle = segment_angles.get(i)
-    if angle is None:
-        print(f"MISSING angle for segment {i}")
-
-polygons, cuts, dangles, invalid = shapely.polygonize_full(segments)
-centroid_tree = shapely.STRtree([x.centroid for x in polygons.geoms])
-central_poly = int(centroid_tree.query_nearest(polygons.centroid, all_matches=False)[0])
-
-print('cuts', cuts)
-print('dangles', dangles)
-print('invalid', invalid)
-
-vert_index = {}  # {(x, y): i}
-faces = []  # [[vi0, vi1, ...]]
-edge_index = {}  # {(vi0, vi1): i}
-edge_vert_i = {} # {i: (vi0, vi1)}
-edge_faces = defaultdict(list)  # {ei: [fi0, fi1]}
-
-for f_i, polygon in enumerate(polygons.geoms):
-    x, y = polygon.exterior.xy
-    face_verts = []
-    for xy in zip(x, y):
-        # print(xy)
-        if xy not in vert_index:
-            vert_index[xy] = len(vert_index)
-        face_verts.append(vert_index[xy])
-    # face_verts has verts like [0, 1, 2, 3, 0]
-    assert face_verts[0] == face_verts[-1]
-    n = len(face_verts)
-    for i in range(n - 1):
-        j = i + 1
-        e = canonical_key2(face_verts[i], face_verts[j])
-        if e not in edge_index:
-            edge_vert_i[len(edge_index)] = e
-            edge_index[e] = len(edge_index)
-        ei = edge_index[e]
-        edge_faces[ei].append(f_i)
-
-    face_verts.pop() # remove duplicate vert at end
-    faces.append(face_verts)
-
-verts = index_to_arr(vert_index, dtype=np.float32) # (V, 2)
-edges = index_to_arr(edge_index, dtype=int)  # (E, 2)
+mesh = parse_svg(file)
 
 # print(verts)
 # print(faces)
 # print(edges)
 
-edge_faces_list = [] # [(f1, ei, f2)]
-for ei, fis in edge_faces.items():
-    if len(fis) == 2:
-        f1, f2 = fis
-        edge_faces_list.append((f1, ei, f2))
-    elif len(fis) > 2:
-        print('wtf', ei, fis)
-
-print(edge_faces_list)
-st, parents = spanning_tree(edge_faces_list, start=central_poly)
-cuts = set(edge_faces_list) - set(st)
-print('st', st)
-print('parents', parents)
-print('cuts', cuts)
-mats, face_verts = compute_matrices(parents, verts, edges, faces)
-opt_data = prepare_opt_data(parents, cuts, face_verts, edges, faces, edge_vert_i, mats)
+mats, face_verts = compute_matrices(mesh)
+opt_data = prepare_opt_data(mesh, face_verts, mats)
+# print(hash(opt_data))
 
 # angles = np.ones(len(faces)) * np.radians(0)
 # verts = apply_rotations(opt_data, angles)
 
-x0 = np.radians(d_to_arr(segment_angles)) * 0.5
+x0 = mesh.face_angles * 0.0
 import time
 t0 = time.time()
 results = snap_opt(opt_data, x0=x0)
 t1 = time.time()
+print(results)
 angles = results.x
 print('loss', results.fun)
 print('took', t1 - t0)
 verts = apply_rotations(opt_data, angles)
+#verts = apply_rotations(opt_data, np.zeros(len(mesh.face_angles)))
+# verts = {i: opt_data.verts_for_face(i) for i in mesh.parents}
 
-plot(segments, segment_angles, polygons, st)
-plot3(faces, verts)
+#plot(segments, segment_angles, polygons, st)
+#plot3(faces, verts)
+plot3(None, verts)
