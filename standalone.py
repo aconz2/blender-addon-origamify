@@ -16,7 +16,6 @@ import jax.scipy.optimize
 
 # V' refers to the total number of duplicated vertices
 
-
 @dataclass
 class Mesh:
     root: int
@@ -26,8 +25,8 @@ class Mesh:
     faces_packed: np.ndarray # (V') int: index into verts
     spanning_tree: List[Tuple[int, int, int]]  # [(f1, ei, f2)]
     cuts: List[Tuple[int, int, int]]  # [(f1, ei, f2)]
-    parents: Dict[int, Tuple[int, int]] # {fi: (parent, edge) | None}
-    children: Dict[int, List[int]]
+    parents: Dict[int, Tuple[int, int] | None] # {fi: (parent, edge) | None}
+    children: Dict[int, List[int]]  # variadic
     segment_angles: Dict[int, float]  # degrees mapping from original segments
     face_angles: np.ndarray # (F) # radians, angle of a face
 
@@ -38,6 +37,9 @@ class Mesh:
 
 @dataclass
 class OptData:
+    # these verts are the duplicated vert positions for each face after being
+    # inverse transformed so that apply_rotations with 0 rotation and the
+    # mat from mats brings them all back into the original position
     verts_idx: np.ndarray # (V', 2): (offset, n) into verts_packed
     verts_packed: np.ndarray # (V', 4) float
     mesh: Mesh
@@ -212,6 +214,10 @@ def parents_to_children(parents):
     children = defaultdict(list)
     root = None
     for fi, parent in parents.items():
+        # even though we use defaultdict, b/c we later d_to_list this
+        # we have to include an empty array for the children
+        # if fi not in children:
+        #     children[fi] = []
         if parent is None:
             root = fi
             continue
@@ -273,8 +279,9 @@ def apply_rotations(opt_data, angles, maxdepth=None):
 
     return verts
 
+# opt_data not hashable because of the ndarray's
 #@jax.jit
-#@jax.jit
+# @partial(jax.jit, static_argnames=['opt_data'])
 def snap_opt_objective(x, opt_data):
     verts = apply_rotations(opt_data, x)
     loss = 0
@@ -290,6 +297,29 @@ def snap_opt(opt_data, x0=None):
     results = jax.scipy.optimize.minimize(
             snap_opt_objective,
             args=(opt_data,),
+            x0=x0,
+            method='BFGS',
+            )
+    return results
+
+def snap_target_objective(x, opt_data, target):
+    verts = apply_rotations(opt_data, x)
+    la = 0
+    for f1, f2, f1v1, f2v1, f1v2, f2v2 in opt_data.correspondence:
+        l1 = ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum()
+        l2 = ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum()
+        la += l1 + l2
+    lb = ((target - x) ** 2).sum()
+    loss = 10 * la + lb
+
+    return loss
+
+def snap_target(opt_data, *, target=None, x0=None):
+    target = opt_data.mesh.face_angles if target is None else target
+    x0 = np.zeros_like(opt_data.mesh.face_angles) if x0 is None else x0
+    results = jax.scipy.optimize.minimize(
+            snap_target_objective,
+            args=(opt_data, target,),
             x0=x0,
             method='BFGS',
             )
@@ -415,36 +445,43 @@ def parse_svg(filename):
         if angle is None:
             print(f"MISSING angle for segment {i}")
 
+    vert_index = {}  # {(x, y): i}
+    edge_index = {}  # {(vi0, vi1): segment_i}
+    for segment in segments:
+        start, end = segment.coords
+        if start not in vert_index:
+            vert_index[start] = len(vert_index)
+        if end not in vert_index:
+            vert_index[end] = len(vert_index)
+        e = canonical_key2(vert_index[start], vert_index[end])
+        assert e not in edge_index
+        edge_index[e] = len(edge_index)
 
     # turn lines into faces
     polygons, cuts, dangles, invalid = shapely.polygonize_full(segments)
     centroid_tree = shapely.STRtree([x.centroid for x in polygons.geoms])
     central_poly = int(centroid_tree.query_nearest(polygons.centroid, all_matches=False)[0])
 
-    # print('cuts', cuts)
-    # print('dangles', dangles)
-    # print('invalid', invalid)
+    if len(cuts.geoms) != 0:
+        raise ValueError('got cuts during polygonization', cuts)
+    if len(dangles.geoms) != 0:
+        raise ValueError('got dangles during polygonization', dangles)
+    if len(invalid.geoms) != 0:
+        raise ValueError('got invalid during polygonization', invalid)
 
-    vert_index = {}  # {(x, y): i}
     faces = []  # [[vi0, vi1, ...]]
-    edge_index = {}  # {(vi0, vi1): i}
     edge_faces = defaultdict(list)  # {ei: [fi0, fi1]}
 
     for f_i, polygon in enumerate(polygons.geoms):
         x, y = polygon.exterior.xy
         face_verts = []
         for xy in zip(x, y):
-            if xy not in vert_index:
-                vert_index[xy] = len(vert_index)
             face_verts.append(vert_index[xy])
         # face_verts has verts like [0, 1, 2, 3, 0]
         assert face_verts[0] == face_verts[-1]
         n = len(face_verts)
         for i in range(n - 1):
-            e = canonical_key2(face_verts[i], face_verts[i + 1])
-            if e not in edge_index:
-                edge_index[e] = len(edge_index)
-            ei = edge_index[e]
+            ei = edge_index[canonical_key2(face_verts[i], face_verts[i+1])]
             edge_faces[ei].append(f_i)
 
         face_verts.pop() # remove duplicate vert at end
@@ -505,20 +542,24 @@ mesh = parse_svg(file)
 
 mats, face_verts = compute_matrices(mesh)
 opt_data = prepare_opt_data(mesh, face_verts, mats)
-# print(hash(opt_data))
+# print(hash(mesh))
 
 # angles = np.ones(len(faces)) * np.radians(0)
 # verts = apply_rotations(opt_data, angles)
 
-x0 = mesh.face_angles * 0.0
+#x0 = mesh.face_angles * 1
 import time
 t0 = time.time()
-results = snap_opt(opt_data, x0=x0)
+results = snap_target(opt_data, target=mesh.face_angles / 10)
+# print('st', mesh.spanning_tree)
+# print('segments', mesh.segment_angles)
+print('target', mesh.face_angles)
 t1 = time.time()
-print(results)
 angles = results.x
+print('nfev', results.nfev)
 print('loss', results.fun)
 print('took', t1 - t0)
+print('angles', angles)
 verts = apply_rotations(opt_data, angles)
 #verts = apply_rotations(opt_data, np.zeros(len(mesh.face_angles)))
 # verts = {i: opt_data.verts_for_face(i) for i in mesh.parents}
