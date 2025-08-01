@@ -65,12 +65,15 @@ class Mesh:
         gen = {}
         gen['r4x'] = r4x
         exec(gen_apply_rotations(mesh, name='apply_rotations'), gen)
+        exec(gen_snap_loss(mesh, name='snap_loss'), gen)
         exec(gen_snap_opt_objective(mesh, name='snap_opt_objective'), gen)
         apply_rotations = jax.jit(gen['apply_rotations'])
         snap_opt_objective = jax.jit(gen['snap_opt_objective'], static_argnames=['apply_rotations'])
+        snap_loss = jax.jit(gen['snap_loss'])
         return OptF(
             apply_rotations=apply_rotations,
             snap_opt_objective=snap_opt_objective,
+            snap_loss=snap_loss,
             )
 
 class OptData(NamedTuple):
@@ -108,6 +111,7 @@ apply_rotations_t = Callable[[OptData, np.ndarray], Dict[int, np.ndarray]]
 class OptF(NamedTuple):
     apply_rotations: apply_rotations_t
     snap_opt_objective: Callable[[np.ndarray, OptData, apply_rotations_t], OptData]
+    snap_loss: Callable[Dict[int, np.ndarray], float]
 
 def d_to_arr(d, dtype=np.float32):
     arr = [None] * len(d)
@@ -355,10 +359,9 @@ def {name}(opt_data_frozen, angles):
 #
 #     return loss
 
-def gen_snap_opt_objective(mesh, name='snap_opt_objective'):
+def gen_snap_loss(mesh, name='snap_loss'):
     header = f'''
-def {name}(x, opt_data_frozen, apply_rotations):
-    verts = apply_rotations(opt_data_frozen, x)
+def {name}(verts):
     loss = 0
 '''
     footer = '''
@@ -381,14 +384,21 @@ def {name}(x, opt_data_frozen, apply_rotations):
 
     return header + '\n'.join(f'    {line}' for line in lines) + footer
 
+def gen_snap_opt_objective(mesh, name='snap_opt_objective'):
+    return f'''
+def {name}(x, opt_data_frozen, apply_rotations):
+    verts = apply_rotations(opt_data_frozen, x)
+    return snap_loss(verts)
+'''
 
-def snap_opt(opt_data_frozen, opt_f, x0=None):
+def snap_opt(opt_data_frozen, opt_f, *, x0=None, maxiter=None):
     x0 = np.zeros(len(opt_data.verts), dtype=np.float32) if x0 is None else x0
     results = jax.scipy.optimize.minimize(
             opt_f.snap_opt_objective,
             args=(opt_data_frozen, opt_f.apply_rotations),
             x0=x0,
             method='BFGS',
+            options={'maxiter': maxiter},
             )
     return results
 
@@ -399,40 +409,55 @@ def snap_opt(opt_data_frozen, opt_f, x0=None):
 def params_to_angles(x, target):
     return (jnp.tanh(x) + 1) / 2 * target
 
-def snap_target_objective(x, opt_data, target, t):
+def snap_target_objective(x, opt_data_frozen, opt_f, target):
     angles = params_to_angles(x, target)
-    verts = apply_rotations(opt_data, angles)
-    la = 0
-    for f1, f2, f1v1, f2v1, f1v2, f2v2 in opt_data.correspondence:
-        l1 = ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum()
-        l2 = ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum()
-        la += l1 + l2
+    verts = opt_f.apply_rotations(opt_data_frozen, angles)
+    la = opt_f.snap_loss(verts)
+    # for f1, f2, f1v1, f2v1, f1v2, f2v2 in opt_data_frozen.correspondence:
+    #     l1 = ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum()
+    #     l2 = ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum()
+    #     la += l1 + l2
 
-    lb = ((target - angles) ** 2).mean()
+    #lb = ((target - angles) ** 2).mean()
     # lb = len(x) - ((jnp.tanh(x) + 1) / 2).sum()
+    lb = -((jnp.tanh(x) + 1) / 2).mean()
 
-    loss = t * la + (1-t) * lb
+    # loss = 10 * t * la + (1-t) * lb
     # loss = la
+    loss = 1e4 * la + lb
 
     return loss
 
-def snap_target(opt_data, *, target=None, x0=None, asteps=50, bsteps=50):
-    # solver = optax.adam(learning_rate=1)
-    solver = optax.adagrad(learning_rate=0.1)
+def snap_target(opt_data_frozen, opt_f, *, target=None, x0=None, asteps=50, bsteps=50, vert_mse=1e-6):
+    # solver = optax.adam(learning_rate=0.5)
+    solver = optax.adagrad(learning_rate=0.5)
+    # solver = optax.lbfgs()
     target = opt_data.mesh.face_angles if target is None else target
     #params = np.zeros_like(opt_data.mesh.face_angles) if x0 is None else x0
     params = np.ones_like(target) if x0 is None else x0
     opt_state = solver.init(params)
     f = jax.grad(snap_target_objective)
     # for t in chain(np.linspace(0, 1, asteps), np.ones(bsteps)):
-    for t in np.ones(asteps) * 0.5:
-        loss = snap_target_objective(params, opt_data, target, t)
-        # angles = params_to_angles(params, target)
+    # for t in np.ones(asteps) * 0.9:
+    #     loss = snap_target_objective(params, opt_data_frozen, opt_f, target, t)
+    #     # angles = params_to_angles(params, target)
+    #     print(loss)
+    #     grad = f(params, opt_data_frozen, opt_f, target, t)
+    #     updates, opt_state = solver.update(grad, opt_state, params)
+    #     params = optax.apply_updates(params, updates)
+    steps = 0
+    while True:
+        loss = snap_target_objective(params, opt_data_frozen, opt_f, target)
         print(loss)
-        grad = f(params, opt_data, target, t)
+        grad = f(params, opt_data_frozen, opt_f, target)
         updates, opt_state = solver.update(grad, opt_state, params)
         params = optax.apply_updates(params, updates)
-    loss = snap_target_objective(params, opt_data, target, 1)
+        verts = opt_f.apply_rotations(opt_data_frozen, params_to_angles(params, target))
+        steps += 1
+        if opt_f.snap_loss(verts) < vert_mse:
+            break
+    print('steps', steps)
+    loss = snap_target_objective(params, opt_data_frozen, opt_f, target)
     angles = params_to_angles(params, target)
     return angles, params, loss
 
@@ -713,38 +738,40 @@ opt_data = prepare_opt_data(mesh, face_verts, mats)
 # print(hash(mesh))
 
 opt_data_frozen = opt_data.freeze()
+target = mesh.face_angles * 0.5
 
-results = snap_opt(opt_data_frozen, opt_f, x0=mesh.face_angles * 0.7)
-angles = results.x
-print('loss', results.fun)
-print('nfev', results.nfev)
+if False:
+    results = snap_opt(opt_data_frozen, opt_f, x0=target, maxiter=1000)
+    angles = results.x
+    print('loss', results.fun)
+    print('nfev', results.nfev)
+
+else:
+    import time
+    t0 = time.time()
+    angles, params, loss = snap_target(
+            opt_data_frozen,
+            opt_f,
+            target=target,
+            # init to 0 is like 50% angle
+            # x0=np.zeros_like(mesh.face_angles),
+            x0=np.ones_like(mesh.face_angles),
+            asteps=200,
+            bsteps=100,
+            )
+    print('params', params)
+    # print('st', mesh.spanning_tree)
+    # print('segments', mesh.segment_angles)
+    print('loss', loss)
+    t1 = time.time()
+    print('took', t1 - t0)
+
+print('target', np.degrees(target))
 print('angles', np.degrees(angles))
-
-# angles = np.ones(len(faces)) * np.radians(0)
-# verts = apply_rotations(opt_data, angles)
-
-# import time
-# t0 = time.time()
-# angles, params, loss = snap_target(
-#         opt_data2,
-#         target=mesh.face_angles / 2,
-#         # init to 0 is like 50% angle
-#         # x0=np.zeros_like(mesh.face_angles),
-#         x0=np.ones_like(mesh.face_angles),
-#         asteps=100,
-#         bsteps=100,
-#         )
-# print('params', params)
-# # print('st', mesh.spanning_tree)
-# # print('segments', mesh.segment_angles)
-# print('loss', loss)
-# print('target', np.degrees(mesh.face_angles / 4))
-# t1 = time.time()
-# print('took', t1 - t0)
-# print('angles', np.degrees(angles))
-# angles = np.zeros(len(mesh.face_angles))
-
+print('diff', np.degrees(target - angles))
+print('angle mse', ((target-angles)**2).sum())
 verts = opt_f.apply_rotations(opt_data_frozen, angles)
+print('vert mse', opt_f.snap_loss(verts))
 #verts = apply_rotations(opt_data, np.zeros(len(mesh.face_angles)))
 # verts = {i: opt_data.verts_for_face(i) for i in mesh.parents}
 
