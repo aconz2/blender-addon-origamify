@@ -56,6 +56,7 @@ class Mesh:
     children: Dict[int, List[int]]
     face_angles: np.ndarray # (F) # radians, angle of a face
     correspondence: List[Tuple[int, int, int, int, int, int]]
+    correspondence_arr: np.ndarray # (2, N) int verts_dup[arr[0]] == verts_dup[arr[1]]
 
     # returns indices
     def verts_for_face(self, fi):
@@ -66,16 +67,9 @@ class Mesh:
         gen = {}
         gen['r4x'] = r4x
         exec(gen_apply_rotations(mesh, name='apply_rotations'), gen)
-        exec(gen_snap_loss(mesh, name='snap_loss'), gen)
-        exec(gen_snap_opt_objective(mesh, name='snap_opt_objective'), gen)
-        # compiling these with inline actually makes things slower
         apply_rotations = jax.jit(gen['apply_rotations'])
-        snap_opt_objective = jax.jit(gen['snap_opt_objective'], static_argnames=['apply_rotations'])
-        snap_loss = jax.jit(gen['snap_loss'])
         return OptF(
             apply_rotations=apply_rotations,
-            snap_opt_objective=snap_opt_objective,
-            snap_loss=snap_loss,
             )
 
 class OptData(NamedTuple):
@@ -85,35 +79,30 @@ class OptData(NamedTuple):
     verts_idx: np.ndarray # (V', 2): (offset, n) into verts_packed
     verts_packed: np.ndarray # (V', 4) float
 
-    children_idx: np.ndarray # (F, 2): (offset, n) into children_packed
-    children_packed: np.ndarray # (_): int
     mats: np.ndarray # (F, 4, 4) float
 
     root: int
+    correspondence_arr: np.ndarray # (2, N) int verts_dup[arr[0]] == verts_dup[arr[1]]
 
     # returns f4 coordinates
     def verts_for_face(self, fi):
         offset, n = self.verts_idx[fi]
         return self.verts_packed[offset:offset+n]
 
-    def children_for_face(self, fi):
-        offset, n = self.children_idx[fi]
-        return self.children_packed[offset:offset+n]
-
     def freeze(self):
-        fields = ['mats'] + [f'v{i}' for i in range(len(self.verts_idx))]
+        fields = ['mats', 'correspondence_arr'] + [f'v{i}' for i in range(len(self.verts_idx))]
         T = namedtuple(f'OptDataFrozen{id(self)}', fields)
-        kwargs = {'mats': self.mats}
+        kwargs = {'mats': self.mats, 'correspondence_arr': self.correspondence_arr}
         for i in range(len(self.verts_idx)):
             kwargs[f'v{i}'] = self.verts_for_face(i)
         return T(**kwargs)
 
 
-apply_rotations_t = Callable[[OptData, np.ndarray], Dict[int, np.ndarray]]
 class OptF(NamedTuple):
-    apply_rotations: apply_rotations_t
-    snap_opt_objective: Callable[[np.ndarray, OptData, apply_rotations_t], OptData]
-    snap_loss: Callable[Dict[int, np.ndarray], float]
+    # OptData is actually OptDataFrozen here
+    # returns all verts in a packed array
+    # can index with mesh.faces_idx
+    apply_rotations: Callable[[OptData, np.ndarray], np.ndarray]
 
 def d_to_arr(d, dtype=np.float32):
     arr = [None] * len(d)
@@ -286,7 +275,6 @@ def pack_ragged(arrs):
 
 def prepare_opt_data(mesh, face_verts, mats):
     verts_idx, verts_packed = pack_ragged(d_to_list(face_verts))
-    children_idx, children_packed = pack_ragged(d_to_list(mesh.children))
 
     # do a pass down the tree that accumulates the inverse
     def go(i, mat):
@@ -301,10 +289,9 @@ def prepare_opt_data(mesh, face_verts, mats):
     return OptData(
         verts_idx=verts_idx,
         verts_packed=verts_packed,
-        children_idx=children_idx,
-        children_packed=children_packed,
         mats=mats,
         root=mesh.root,
+        correspondence_arr=mesh.correspondence_arr,
     )
 
 # def apply_rotations(opt_data, angles, maxdepth=None):
@@ -327,7 +314,7 @@ def gen_apply_rotations(mesh, name='apply_rotations'):
     header = f'''
 def {name}(opt_data_frozen, angles):
     import jax.numpy as jnp
-    ret = {{}}
+    mats = opt_data_frozen.mats
 '''
     footer = '''
     return ret
@@ -338,65 +325,37 @@ def {name}(opt_data_frozen, angles):
         nonlocal global_mat_num
         my_mat_num = global_mat_num
         global_mat_num += 1
-        lines.append(f'm{my_mat_num} = m{parent_mat_num} @ opt_data_frozen.mats[{i}] @ r4x(angles[{i}])')
-        lines.append(f'ret[{i}] = opt_data_frozen.v{i} @ m{my_mat_num}.T')
+        lines.append(f'm{my_mat_num} = m{parent_mat_num} @ mats[{i}] @ r4x(angles[{i}])')
+        lines.append(f'r{i} = opt_data_frozen.v{i} @ m{my_mat_num}.T')
 
         for child in mesh.children[i]:
             go(child, my_mat_num)
 
-    lines.append(f'ret[{mesh.root}] = opt_data_frozen.v{mesh.root}')
+    lines.append(f'r{mesh.root} = opt_data_frozen.v{mesh.root}')
     lines.append(f'm0 = jnp.eye(4)')
     for child in mesh.children[mesh.root]:
         go(child, 0)
 
-    return header + '\n'.join(f'    {line}' for line in lines) + footer
+    lines.append('ret = jnp.concatenate([')
+    for i in sorted(mesh.parents):
+        lines.append(f'    r{i},')
+    lines.append('])')
 
-# def snap_opt_objective(x, opt_data):
-#     verts = apply_rotations(opt_data, x)
-#     loss = 0
-#     for f1, f2, f1v1, f2v1, f1v2, f2v2 in opt_data.correspondence:
-#         l1 = ((verts[f1][f1v1] - verts[f2][f2v1])**2).sum()
-#         l2 = ((verts[f1][f1v2] - verts[f2][f2v2])**2).sum()
-#         loss += l1 + l2
-#
-#     return loss
-
-def gen_snap_loss(mesh, name='snap_loss'):
-    header = f'''
-def {name}(verts):
-    loss = 0
-'''
-    footer = '''
-    return loss
-'''
-    lines = []
-
-    loaded = set()
-    def gen_load(i):
-        if i in loaded:
-            return
-        loaded.add(i)
-        lines.append(f'f{i} = verts[{i}]')
-
-    for f1, f2, f1v1, f2v1, f1v2, f2v2 in mesh.correspondence:
-        gen_load(f1)
-        gen_load(f2)
-        lines.append(f'loss += ((f{f1}[{f1v1}] - f{f2}[{f2v1}]) ** 2).sum()')
-        lines.append(f'loss += ((f{f1}[{f1v2}] - f{f2}[{f2v2}]) ** 2).sum()')
 
     return header + '\n'.join(f'    {line}' for line in lines) + footer
 
-def gen_snap_opt_objective(mesh, name='snap_opt_objective'):
-    return f'''
-def {name}(x, opt_data_frozen, apply_rotations):
+def snap_loss(verts, opt_data_frozen):
+    c = opt_data_frozen.correspondence_arr
+    return ((verts[c[0]] - verts[c[1]]) ** 2).sum()
+
+def snap_opt_objective(x, opt_data_frozen, apply_rotations):
     verts = apply_rotations(opt_data_frozen, x)
-    return snap_loss(verts)
-'''
+    return snap_loss(verts, opt_data_frozen)
 
 def snap_opt(opt_data_frozen, opt_f, *, x0=None):
     x0 = np.zeros(len(opt_data.verts), dtype=np.float32) if x0 is None else x0
     results = jax.scipy.optimize.minimize(
-            opt_f.snap_opt_objective,
+            snap_opt_objective,
             args=(opt_data_frozen, opt_f.apply_rotations),
             x0=x0,
             method='BFGS',
@@ -418,7 +377,7 @@ def snap_target_objective(x, opt_data_frozen, target, *, opt_f, vert_weight=1e4)
     x01 = to01(x)
     angles = x01 * target
     verts = opt_f.apply_rotations(opt_data_frozen, angles)
-    la = opt_f.snap_loss(verts)
+    la = snap_loss(verts, opt_data_frozen)
 
     # this is the average of the params values from [0, 1], where 1 means
     # we are at the target angle, so this loss is from [-1, 0] where -1 is
@@ -435,9 +394,10 @@ def snap_target(opt_data_frozen, opt_f, *, objective, target=None, x0=None, vert
     steps = 0
     solver = optax.adagrad(learning_rate=1.0)
     opt_state = solver.init(params)
-    g = jax.grad(objective, has_aux=True)
+    g = jax.jit(jax.grad(objective, has_aux=True))
     while True:
         grad, (loss, la, lb) = g(params, opt_data_frozen, target)
+        # print('loss', loss)
         updates, opt_state = solver.update(grad, opt_state, params)
         params = optax.apply_updates(params, updates)
         steps += 1
@@ -448,7 +408,6 @@ def snap_target(opt_data_frozen, opt_f, *, objective, target=None, x0=None, vert
     angles = params_to_angles(params, target)
     return angles, params, loss, la, lb
 
-# todo opacity
 def get_angle(attr):
     if 'style' in attr:
         attr = dict(x.split(':') for x in attr['style'].split(';'))
@@ -521,12 +480,13 @@ def plot(mesh, svg):
     plt.savefig('/tmp/plot.png')
     plt.close()
 
-def plot3(verts):
+def plot3(mesh, verts):
     import matplotlib.pyplot as plt
     fig = plt.figure()
     ax = plt.axes(projection='3d')
 
-    for fi, vs in verts.items():
+    for offset, n in mesh.faces_idx:
+        vs = verts[offset:offset+n]
         xs, ys, zs = list(vs[:, 0]), list(vs[:, 1]), list(vs[:, 2])
         xs.append(xs[0])
         ys.append(ys[0])
@@ -688,6 +648,7 @@ def svg_to_mesh(svg):
             faces[f1].index(v1),
             faces[f2].index(v1),
             ))
+    correspondence_arr = correspondence_to_arr(faces, correspondence)
 
 
     return Mesh(
@@ -702,9 +663,21 @@ def svg_to_mesh(svg):
         cuts=cuts,
         face_angles=face_angles,
         correspondence=correspondence,
+        correspondence_arr=correspondence_arr,
         )
 
-def optimize(mesh):
+def correspondence_to_arr(faces, correspondence):
+    """faces: [[vi0, vi1, ...], ...]"""
+    offset = np.array([len(arr) for arr in faces]).cumsum()
+    offset[1:] = offset[:-1]
+    offset[0] = 0
+    l = []
+    for f1, f2, f1v1, f2v1, f1v2, f2v2 in correspondence:
+        l.append((f1v1 + offset[f1], f2v1 + offset[f2]))
+        l.append((f1v2 + offset[f1], f2v2 + offset[f2]))
+    return np.array(l).T
+
+def optimize_mesh(mesh):
     face_with_cuts = set()
     verts_for_face = defaultdict(list)
     cut_verts = 0
@@ -745,11 +718,10 @@ mesh = svg_to_mesh(svg)
 # import sys
 # sys.exit(0)
 
-plot(mesh, svg)
-print(mesh.root)
+# plot(mesh, svg)
 
 print(gen_apply_rotations(mesh))
-print(gen_snap_opt_objective(mesh))
+# print(gen_snap_opt_objective(mesh))
 
 
 opt_f = mesh.gen_f()
@@ -791,9 +763,9 @@ print('angles', np.degrees(angles))
 print('diff', np.degrees(target - angles))
 print('angle mse', ((target-angles)**2).sum())
 verts = opt_f.apply_rotations(opt_data_frozen, angles)
-print('vert mse', opt_f.snap_loss(verts))
+print('vert mse', snap_loss(verts, opt_data_frozen))
 
-plot3(verts)
+plot3(mesh, verts)
 
 # subdivide
 if False:
@@ -818,4 +790,15 @@ if False:
         print('la', la, 'lb', lb)
         print('angle mse', ((target-angles)**2).sum())
         verts = opt_f.apply_rotations(opt_data_frozen, angles)
-        print('vert mse', opt_f.snap_loss(verts))
+        print('vert mse', snap_loss(verts, opt_data_frozen))
+
+# so maybe next thing to try is
+# take jacobian of f(angles) -> positions so that we get (at a specific angle)
+# then dx0 / dtheta0, dy0 / dtheta0, dz0 / dtheta0, ... dzn / dtheta0
+# then dx0 / dtheta1, dy0 / dtheta1, dz0 / dtheta0, ... dzn / dtheta1
+# we then have to find scaling terms for each dtheta (a column vector) that when
+# applied to each row (scale broadcasts across row), then sum the columns giving the total
+# dx0 / dtheta0 + dx0 / dtheta1 + ... + dx0 / dthetan
+# and then with correspondence we know that some elements in the summed-row need to be equal
+# b/c they are the same vertices
+# should be able to then optimize that problem
