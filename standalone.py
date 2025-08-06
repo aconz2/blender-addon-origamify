@@ -80,6 +80,7 @@ class OptData(NamedTuple):
     verts_packed: np.ndarray # (V', 4) float
 
     mats: np.ndarray # (F, 4, 4) float
+    face_angles: np.ndarray # (F) radians,
 
     root: int
     correspondence_arr: np.ndarray # (2, N) int verts_dup[arr[0]] == verts_dup[arr[1]]
@@ -90,9 +91,13 @@ class OptData(NamedTuple):
         return self.verts_packed[offset:offset+n]
 
     def freeze(self):
-        fields = ['mats', 'correspondence_arr'] + [f'v{i}' for i in range(len(self.verts_idx))]
+        fields = ['mats', 'correspondence_arr', 'face_angles'] + [f'v{i}' for i in range(len(self.verts_idx))]
         T = namedtuple(f'OptDataFrozen{id(self)}', fields)
-        kwargs = {'mats': self.mats, 'correspondence_arr': self.correspondence_arr}
+        kwargs = {
+            'mats': self.mats,
+            'correspondence_arr': self.correspondence_arr,
+            'face_angles': self.face_angles,
+        }
         for i in range(len(self.verts_idx)):
             kwargs[f'v{i}'] = self.verts_for_face(i)
         return T(**kwargs)
@@ -102,7 +107,9 @@ class OptF(NamedTuple):
     # OptData is actually OptDataFrozen here
     # returns all verts in a packed array
     # can index with mesh.faces_idx
-    apply_rotations: Callable[[OptData, np.ndarray], np.ndarray]
+    # angles -> (v, 3)
+    # hom 4th component is chopped off
+    apply_rotations: Callable[[np.ndarray, OptData], np.ndarray]
 
 def d_to_arr(d, dtype=np.float32):
     arr = [None] * len(d)
@@ -282,7 +289,7 @@ def prepare_opt_data(mesh, face_verts, mats):
         mat = mat @ mats[i]
         for child in mesh.children[i]:
             go(child, mat)
-    go(mesh.root, np.eye(4))
+    go(mesh.root, np.eye(4, dtype=np.float32))
 
     mats = np.array(d_to_list(mats))
 
@@ -292,6 +299,7 @@ def prepare_opt_data(mesh, face_verts, mats):
         mats=mats,
         root=mesh.root,
         correspondence_arr=mesh.correspondence_arr,
+        face_angles=mesh.face_angles,
     )
 
 # def apply_rotations(opt_data, angles, maxdepth=None):
@@ -312,7 +320,7 @@ def prepare_opt_data(mesh, face_verts, mats):
 
 def gen_apply_rotations(mesh, name='apply_rotations'):
     header = f'''
-def {name}(opt_data_frozen, angles):
+def {name}(angles, opt_data_frozen):
     import jax.numpy as jnp
     mats = opt_data_frozen.mats
 '''
@@ -332,13 +340,13 @@ def {name}(opt_data_frozen, angles):
             go(child, my_mat_num)
 
     lines.append(f'r{mesh.root} = opt_data_frozen.v{mesh.root}')
-    lines.append(f'm0 = jnp.eye(4)')
+    lines.append(f'm0 = jnp.eye(4, dtype=jnp.float32)')
     for child in mesh.children[mesh.root]:
         go(child, 0)
 
     lines.append('ret = jnp.concatenate([')
     for i in sorted(mesh.parents):
-        lines.append(f'    r{i},')
+        lines.append(f'    r{i}[:, :3],')
     lines.append('])')
 
 
@@ -349,7 +357,7 @@ def snap_loss(verts, opt_data_frozen):
     return ((verts[c[0]] - verts[c[1]]) ** 2).sum()
 
 def snap_opt_objective(x, opt_data_frozen, apply_rotations):
-    verts = apply_rotations(opt_data_frozen, x)
+    verts = apply_rotations(x, opt_data_frozen)
     return snap_loss(verts, opt_data_frozen)
 
 def snap_opt(opt_data_frozen, opt_f, *, x0=None):
@@ -376,7 +384,7 @@ def params_to_angles(x, target):
 def snap_target_objective(x, opt_data_frozen, target, *, opt_f, vert_weight=1e4):
     x01 = to01(x)
     angles = x01 * target
-    verts = opt_f.apply_rotations(opt_data_frozen, angles)
+    verts = opt_f.apply_rotations(angles, opt_data_frozen)
     la = snap_loss(verts, opt_data_frozen)
 
     # this is the average of the params values from [0, 1], where 1 means
@@ -392,7 +400,7 @@ def snap_target(opt_data_frozen, opt_f, *, objective, target=None, x0=None, vert
     target = opt_data.mesh.face_angles if target is None else target
     params = np.ones_like(target) if x0 is None else x0
     steps = 0
-    solver = optax.adagrad(learning_rate=1.0)
+    solver = optax.adagrad(learning_rate=0.5)
     opt_state = solver.init(params)
     g = jax.jit(jax.grad(objective, has_aux=True))
     while True:
@@ -407,6 +415,66 @@ def snap_target(opt_data_frozen, opt_f, *, objective, target=None, x0=None, vert
     loss, (_, la, lb) = objective(params, opt_data_frozen, target)
     angles = params_to_angles(params, target)
     return angles, params, loss, la, lb
+
+def zsignarr(arr):
+    return jnp.sign(arr) * (arr != 0)
+
+@jax.jit
+def jac_scale_objective(scale, jac, corr_arr, sign):
+    y = (jac * (scale * sign)).sum(axis=-1)
+    loss = ((y[corr_arr[0]] - y[corr_arr[1]]) ** 2).sum()
+    return loss, loss
+
+jac_scale_objective_grad = jax.jit(jax.grad(jac_scale_objective, has_aux=True))
+
+def min_jac_scale_objective(jac, corr_arr, sign, mse=1e-6):
+    steps = 0
+    # solver = optax.adagrad(learning_rate=1.0)
+    solver = optax.adam(learning_rate=1.0)
+    params = np.ones(jac.shape[-1])
+    opt_state = solver.init(params)
+    while True:
+        grad, loss = jac_scale_objective_grad(params, jac, corr_arr, sign)
+        # print('loss', loss)
+        updates, opt_state = solver.update(grad, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        steps += 1
+        if loss < mse:
+            break
+    print('steps', steps)
+    return params
+
+def integrate(opt_data_frozen, opt_f, *, stepsize=0.01, steps=10, x0=None, maxangle=None):
+    if x0 is None:
+        x0 = np.zeros(len(opt_data_frozen.mats), dtype=np.float32)
+
+    # jacfwd seems to be fastest
+    apply_rotations_jac = jax.jit(jax.jacfwd(opt_f.apply_rotations))
+
+    sign = zsignarr(opt_data_frozen.face_angles)
+    corr_arr = opt_data_frozen.correspondence_arr
+
+    cur = x0
+    for i in range(steps):
+        print('step', i)
+        jac = apply_rotations_jac(cur, opt_data_frozen)
+        # jac has shape (verts, 3, angles)
+        # for each coord of each vert, we get the partial deriv wrt each angle
+        # we then seek a scale factor for each angle st when we scale those
+        # derivs and sum them all (each angle's contributions), then we
+        # minimize the difference of deriv between correspondence
+
+        scale = min_jac_scale_objective(jac, corr_arr, sign)
+        print('scale', scale)
+        cur += (scale / scale.max() * sign) * stepsize
+
+        print('cur', cur)
+        print('known loss', snap_loss(opt_f.apply_rotations(cur, opt_data_frozen), opt_data_frozen))
+        if maxangle is not None and cur.max() >= maxangle:
+            break
+
+    print(np.degrees(cur))
+    print('done')
 
 def get_angle(attr):
     if 'style' in attr:
@@ -732,6 +800,11 @@ opt_data_frozen = opt_data.freeze()
 
 target = mesh.face_angles * 0.8
 
+integrate(opt_data_frozen, opt_f, steps=300, maxangle=np.pi * 0.95)
+
+import sys
+sys.exit(0)
+
 if False:
     t0 = time.time()
     results = snap_opt(opt_data_frozen, opt_f, x0=target)
@@ -762,7 +835,7 @@ print('target', np.degrees(target))
 print('angles', np.degrees(angles))
 print('diff', np.degrees(target - angles))
 print('angle mse', ((target-angles)**2).sum())
-verts = opt_f.apply_rotations(opt_data_frozen, angles)
+verts = opt_f.apply_rotations(angles, opt_data_frozen)
 print('vert mse', snap_loss(verts, opt_data_frozen))
 
 plot3(mesh, verts)
@@ -789,7 +862,7 @@ if False:
         print('took', t1 - t0)
         print('la', la, 'lb', lb)
         print('angle mse', ((target-angles)**2).sum())
-        verts = opt_f.apply_rotations(opt_data_frozen, angles)
+        verts = opt_f.apply_rotations(angles, opt_data_frozen)
         print('vert mse', snap_loss(verts, opt_data_frozen))
 
 # so maybe next thing to try is
