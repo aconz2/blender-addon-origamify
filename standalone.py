@@ -18,17 +18,16 @@ import optax
 # of verts that are part of the cuts
 # and another for symmetry
 
-# my angles are flipped, just flipped here for the time being
 stroke_to_angle = {
-    '#ff0000': -np.pi,
-    '#0000ff': np.pi,
+    '#ff0000': np.pi,  # red mountain
+    '#0000ff': -np.pi, # blue valley
     '#000000': 0,
     '#ffff00': 0,  # yellow for trianglurization
 }
 
 angle_to_stroke = {
-    -1: '#ff0000',
-    1: '#0000ff',
+    1: '#ff0000',
+    -1: '#0000ff',
     0: '#000000',
 }
 
@@ -241,12 +240,14 @@ def compute_matrices(mesh):
         a, b = mesh.verts[mesh.edges[ei]]
         mid = (a + b) / 2
         k = np.array([0, 0, 1])
+        # to get the right edge direction for this edge, we check each direction and whether it moves the z coordinates of the face positive or negative
+        # the other way I think would be to sort the verts CCW
         for i2 in a - b, b - a:
             i = normalized(np.array([i2[0], i2[1], 0]))
             j = np.cross(i, k)
             cob = change_of_basis_matrix(mid, i, j, k)
             cob_inv = np.linalg.inv(cob)
-            v2 = verts4[mesh.verts_for_face(fi)] @ cob_inv.T @ r4x(np.pi / 2).T
+            v2 = verts4[mesh.verts_for_face(fi)] @ cob_inv.T @ r4x(np.pi / 2)
             zsum = v2[:, 2].sum()
             if zsum > 0:
                 succ = True
@@ -354,7 +355,7 @@ def {name}(angles, opt_data_frozen):
 
 def snap_loss(verts, opt_data_frozen):
     c = opt_data_frozen.correspondence_arr
-    return ((verts[c[0]] - verts[c[1]]) ** 2).sum()
+    return ((verts[c[0]] - verts[c[1]]) ** 2).mean()
 
 def snap_opt_objective(x, opt_data_frozen, apply_rotations):
     verts = apply_rotations(x, opt_data_frozen)
@@ -422,7 +423,7 @@ def zsignarr(arr):
 @jax.jit
 def jac_scale_objective(scale, jac, corr_arr, sign):
     y = (jac * (scale * sign)).sum(axis=-1)
-    loss = ((y[corr_arr[0]] - y[corr_arr[1]]) ** 2).sum()
+    loss = ((y[corr_arr[0]] - y[corr_arr[1]]) ** 2).mean()
     return loss, loss
 
 jac_scale_objective_grad = jax.jit(jax.grad(jac_scale_objective, has_aux=True))
@@ -455,6 +456,8 @@ def integrate(opt_data_frozen, opt_f, *, stepsize=0.01, steps=10, x0=None, maxan
     corr_arr = opt_data_frozen.correspondence_arr
 
     cur = x0
+    angles = [x0]
+
     for i in range(steps):
         print('step', i)
         jac = apply_rotations_jac(cur, opt_data_frozen)
@@ -470,11 +473,13 @@ def integrate(opt_data_frozen, opt_f, *, stepsize=0.01, steps=10, x0=None, maxan
 
         print('cur', cur)
         print('known loss', snap_loss(opt_f.apply_rotations(cur, opt_data_frozen), opt_data_frozen))
+        angles.append(cur)
         if maxangle is not None and cur.max() >= maxangle:
             break
 
     print(np.degrees(cur))
     print('done')
+    return np.array(angles)
 
 def get_angle(attr):
     if 'style' in attr:
@@ -566,6 +571,14 @@ def plot3(mesh, verts):
     plt.savefig('/tmp/plot3.png')
     # plt.show()
     plt.close()
+
+def plot_angles(angles):
+    import matplotlib.pyplot as plt
+    for i, a in enumerate(angles.T):
+        plt.plot(a, label=f'{i}')
+    plt.tight_layout()
+    plt.legend()
+    plt.savefig('/tmp/plot_angles.png')
 
 def total_vert_lengths(verts):
     s = 0
@@ -800,10 +813,12 @@ opt_data_frozen = opt_data.freeze()
 
 target = mesh.face_angles * 0.8
 
-integrate(opt_data_frozen, opt_f, steps=300, maxangle=np.pi * 0.95)
+if False:
+    angles = integrate(opt_data_frozen, opt_f, steps=300, maxangle=np.pi * 0.95)
+    plot_angles(angles)
 
-import sys
-sys.exit(0)
+    import sys
+    sys.exit(0)
 
 if False:
     t0 = time.time()
@@ -834,7 +849,7 @@ print('took', t1 - t0)
 print('target', np.degrees(target))
 print('angles', np.degrees(angles))
 print('diff', np.degrees(target - angles))
-print('angle mse', ((target-angles)**2).sum())
+print('angle mse', ((target-angles)**2).mean())
 verts = opt_f.apply_rotations(angles, opt_data_frozen)
 print('vert mse', snap_loss(verts, opt_data_frozen))
 
@@ -861,17 +876,6 @@ if False:
         t1 = time.time()
         print('took', t1 - t0)
         print('la', la, 'lb', lb)
-        print('angle mse', ((target-angles)**2).sum())
+        print('angle mse', ((target-angles)**2).mean())
         verts = opt_f.apply_rotations(angles, opt_data_frozen)
         print('vert mse', snap_loss(verts, opt_data_frozen))
-
-# so maybe next thing to try is
-# take jacobian of f(angles) -> positions so that we get (at a specific angle)
-# then dx0 / dtheta0, dy0 / dtheta0, dz0 / dtheta0, ... dzn / dtheta0
-# then dx0 / dtheta1, dy0 / dtheta1, dz0 / dtheta0, ... dzn / dtheta1
-# we then have to find scaling terms for each dtheta (a column vector) that when
-# applied to each row (scale broadcasts across row), then sum the columns giving the total
-# dx0 / dtheta0 + dx0 / dtheta1 + ... + dx0 / dthetan
-# and then with correspondence we know that some elements in the summed-row need to be equal
-# b/c they are the same vertices
-# should be able to then optimize that problem
