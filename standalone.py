@@ -468,10 +468,10 @@ def integrate(opt_data_frozen, opt_f, *, stepsize=0.01, steps=10, x0=None, maxan
         # minimize the difference of deriv between correspondence
 
         scale = min_jac_scale_objective(jac, corr_arr, sign)
-        print('scale', scale)
+        # print('scale', scale)
         cur += (scale / scale.max() * sign) * stepsize
 
-        print('cur', cur)
+        # print('cur', cur)
         print('known loss', snap_loss(opt_f.apply_rotations(cur, opt_data_frozen), opt_data_frozen))
         angles.append(cur)
         if maxangle is not None and cur.max() >= maxangle:
@@ -572,9 +572,9 @@ def plot3(mesh, verts):
     # plt.show()
     plt.close()
 
-def plot_angles(angles):
+def plot_angles(angless):
     import matplotlib.pyplot as plt
-    for i, a in enumerate(angles.T):
+    for i, a in enumerate(np.degrees(angless.T)):
         plt.plot(a, label=f'{i}')
     plt.tight_layout()
     plt.legend()
@@ -788,8 +788,8 @@ def optimize_mesh(mesh):
 
 # file = 'miura-ori.svg'
 # file = 'test1.svg'
-# file = 'flasher1.svg'
-file = 'flasher0.svg'
+#file = 'flasher3.svg'
+file = 'flasher5.svg'
 # file = 'accordion.svg'
 svg = parse_svg(file)
 mesh = svg_to_mesh(svg)
@@ -813,22 +813,31 @@ opt_data_frozen = opt_data.freeze()
 
 target = mesh.face_angles * 0.8
 
-if False:
-    angles = integrate(opt_data_frozen, opt_f, steps=300, maxangle=np.pi * 0.95)
-    plot_angles(angles)
+# method = 'snap'
+# method = 'target'
+method = 'integrate'
 
-    import sys
-    sys.exit(0)
+if method == 'integrate':
+    t0 = time.time()
+    # angless = integrate(opt_data_frozen, opt_f, steps=400, maxangle=np.pi * 0.95)
+    angless = integrate(opt_data_frozen, opt_f, steps=500)
+    t1 = time.time()
+    plot_angles(angless)
+    angles = angless[-1]
 
-if False:
+elif method == 'snap':
     t0 = time.time()
     results = snap_opt(opt_data_frozen, opt_f, x0=target)
     t1 = time.time()
     angles = results.x
     print('loss', results.fun)
     print('nfev', results.nfev)
+    print('target', np.degrees(target))
+    print('angles', np.degrees(angles))
+    print('diff', np.degrees(target - angles))
+    print('angle mse', ((target-angles)**2).mean())
 
-else:
+elif method == 'target':
     t0 = time.time()
     # the more unsure we are about the fold angles from the SVG, the higher vert_weight should be
     snap_target_objective_ = jax.jit(partial(snap_target_objective, opt_f=opt_f, vert_weight=1e4))
@@ -844,12 +853,12 @@ else:
     # print('segments', mesh.segment_angles)
     print('la', la, 'lb', lb)
     print('loss', loss)
+    print('target', np.degrees(target))
+    print('angles', np.degrees(angles))
+    print('diff', np.degrees(target - angles))
+    print('angle mse', ((target-angles)**2).mean())
 
 print('took', t1 - t0)
-print('target', np.degrees(target))
-print('angles', np.degrees(angles))
-print('diff', np.degrees(target - angles))
-print('angle mse', ((target-angles)**2).mean())
 verts = opt_f.apply_rotations(angles, opt_data_frozen)
 print('vert mse', snap_loss(verts, opt_data_frozen))
 
