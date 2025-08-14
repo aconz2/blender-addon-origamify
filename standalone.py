@@ -12,6 +12,7 @@ import numpy as np
 import jax.numpy as jnp
 import jax
 import jax.scipy.optimize
+from scipy.integrate import RK45
 import optax
 
 # TODO there is a big compute reduction we can do by only calculating the position
@@ -420,7 +421,6 @@ def snap_target(opt_data_frozen, opt_f, *, objective, target=None, x0=None, vert
 def zsignarr(arr):
     return jnp.sign(arr) * (arr != 0)
 
-@jax.jit
 def jac_scale_objective(scale, jac, corr_arr, sign):
     y = (jac * (scale * sign)).sum(axis=-1)
     loss = ((y[corr_arr[0]] - y[corr_arr[1]]) ** 2).mean()
@@ -428,11 +428,12 @@ def jac_scale_objective(scale, jac, corr_arr, sign):
 
 jac_scale_objective_grad = jax.jit(jax.grad(jac_scale_objective, has_aux=True))
 
-def min_jac_scale_objective(jac, corr_arr, sign, mse=1e-6):
+def min_jac_scale_objective(jac, corr_arr, sign, x0=None, mse=1e-7):
     steps = 0
-    # solver = optax.adagrad(learning_rate=1.0)
-    solver = optax.adam(learning_rate=1.0)
-    params = np.ones(jac.shape[-1])
+    # adam does better here
+    # solver = optax.adagrad(learning_rate=0.1)
+    solver = optax.adam(learning_rate=0.1)
+    params = np.ones(jac.shape[-1]) if x0 is None else x0
     opt_state = solver.init(params)
     while True:
         grad, loss = jac_scale_objective_grad(params, jac, corr_arr, sign)
@@ -445,7 +446,7 @@ def min_jac_scale_objective(jac, corr_arr, sign, mse=1e-6):
     print('steps', steps)
     return params
 
-def integrate(opt_data_frozen, opt_f, *, stepsize=0.01, steps=10, x0=None, maxangle=None):
+def integrate(opt_data_frozen, opt_f, *, stepsize=0.1, steps=10, x0=None, maxangle=None):
     if x0 is None:
         x0 = np.zeros(len(opt_data_frozen.mats), dtype=np.float32)
 
@@ -457,25 +458,53 @@ def integrate(opt_data_frozen, opt_f, *, stepsize=0.01, steps=10, x0=None, maxan
 
     cur = x0
     angles = [x0]
+    h = stepsize
+    scale_x0 = None
 
-    for i in range(steps):
-        print('step', i)
-        jac = apply_rotations_jac(cur, opt_data_frozen)
+    def f(x):
+        jac = apply_rotations_jac(x, opt_data_frozen)
         # jac has shape (verts, 3, angles)
         # for each coord of each vert, we get the partial deriv wrt each angle
         # we then seek a scale factor for each angle st when we scale those
         # derivs and sum them all (each angle's contributions), then we
         # minimize the difference of deriv between correspondence
 
-        scale = min_jac_scale_objective(jac, corr_arr, sign)
-        # print('scale', scale)
-        cur += (scale / scale.max() * sign) * stepsize
+        scale = min_jac_scale_objective(jac, corr_arr, sign, x0=scale_x0)
+
+        y = scale / scale.sum() * sign
+
+        if maxangle is not None:
+            # set deriv to 0 for any angle that is above maxangle
+            y *= jnp.abs(x) < maxangle
+
+        return scale, y
+
+    for i in range(steps):
+        print('step', i)
+
+        # using the scale returned from k2-4 as scale_x0 makes it go crazy
+
+        # rk4
+        scale_x0, k1 = f(cur)
+        _, k2 = f(cur + h * k1/2)
+        _, k3 = f(cur + h * k2/2)
+        _, k4 = f(cur + h * k3)
+        y = h/6 * (k1 + 2*k2 + 2*k3 + k4)
+        cur += y
 
         # print('cur', cur)
-        print('known loss', snap_loss(opt_f.apply_rotations(cur, opt_data_frozen), opt_data_frozen))
-        angles.append(cur)
-        if maxangle is not None and cur.max() >= maxangle:
+        l = snap_loss(opt_f.apply_rotations(cur, opt_data_frozen), opt_data_frozen)
+        if l > 1e-6:
+            print('WARN loss ', l)
             break
+        print('known loss', l)
+        angles.append(cur)
+
+        if np.abs(y).sum() < 1e-6:
+            break
+        # if maxangle is not None and cur.max() >= maxangle:
+        #     break
+
 
     print(np.degrees(cur))
     print('done')
@@ -579,6 +608,31 @@ def plot_angles(angless):
     plt.tight_layout()
     plt.legend()
     plt.savefig('/tmp/plot_angles.png')
+    plt.close()
+
+def plot3_animate(mesh, opt_data_frozen, angless):
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+    fig = plt.figure()
+    ax = plt.axes(projection='3d')
+    lines = [ax.plot([], [], [])[0] for _ in mesh.faces_idx]
+
+    ax.set_xlim([-1, 1])
+    ax.set_ylim([-1, 1])
+    ax.set_aspect('equal')
+
+    def update(frame):
+        verts = opt_f.apply_rotations(angless[frame], opt_data_frozen)
+        for i, (offset, n) in enumerate(mesh.faces_idx):
+            vs = verts[offset:offset+n]
+            xs, ys, zs = list(vs[:, 0]), list(vs[:, 1]), list(vs[:, 2])
+            xs.append(xs[0])
+            ys.append(ys[0])
+            zs.append(zs[0])
+            lines[i].set_data_3d(xs, ys, zs)
+
+    animation = animation.FuncAnimation(fig, update, frames=len(angless), interval=100)
+    plt.show()
 
 def total_vert_lengths(verts):
     s = 0
@@ -819,11 +873,12 @@ method = 'integrate'
 
 if method == 'integrate':
     t0 = time.time()
-    # angless = integrate(opt_data_frozen, opt_f, steps=400, maxangle=np.pi * 0.95)
-    angless = integrate(opt_data_frozen, opt_f, steps=500)
+    angless = integrate(opt_data_frozen, opt_f, steps=500, maxangle=np.pi * 0.99)
+    # angless = integrate(opt_data_frozen, opt_f, steps=100)
     t1 = time.time()
     plot_angles(angless)
     angles = angless[-1]
+    plot3_animate(mesh, opt_data_frozen, angless)
 
 elif method == 'snap':
     t0 = time.time()
