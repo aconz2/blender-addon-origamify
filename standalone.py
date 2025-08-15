@@ -421,14 +421,18 @@ def snap_target(opt_data_frozen, opt_f, *, objective, target=None, x0=None, vert
 def zsignarr(arr):
     return jnp.sign(arr) * (arr != 0)
 
-def jac_scale_objective(scale, jac, corr_arr, sign):
-    y = (jac * (scale * sign)).sum(axis=-1)
+def jac_scale_objective(x, jac, corr_arr, sign, mask):
+    # mask sets the deriv to 0 for any angle that is above maxangle
+    # sign is -1,0,1 array that makes the sign of the change is likely correct
+    # we don't guarantee that the params don't dip below 0
+    # tried with to01(x) but doesn't do well
+    y = (jac * (x * sign * mask)).sum(axis=-1)
     loss = ((y[corr_arr[0]] - y[corr_arr[1]]) ** 2).mean()
     return loss, loss
 
 jac_scale_objective_grad = jax.jit(jax.grad(jac_scale_objective, has_aux=True))
 
-def min_jac_scale_objective(jac, corr_arr, sign, x0=None, mse=1e-7):
+def min_jac_scale_objective(jac, corr_arr, sign, mask, x0=None, mse=1e-7):
     steps = 0
     # adam does better here
     # solver = optax.adagrad(learning_rate=0.1)
@@ -436,7 +440,7 @@ def min_jac_scale_objective(jac, corr_arr, sign, x0=None, mse=1e-7):
     params = np.ones(jac.shape[-1]) if x0 is None else x0
     opt_state = solver.init(params)
     while True:
-        grad, loss = jac_scale_objective_grad(params, jac, corr_arr, sign)
+        grad, loss = jac_scale_objective_grad(params, jac, corr_arr, sign, mask)
         # print('loss', loss)
         updates, opt_state = solver.update(grad, opt_state, params)
         params = optax.apply_updates(params, updates)
@@ -460,6 +464,7 @@ def integrate(opt_data_frozen, opt_f, *, stepsize=0.1, steps=10, x0=None, maxang
     angles = [x0]
     h = stepsize
     scale_x0 = None
+    mask = np.ones_like(x0)
 
     def f(x):
         jac = apply_rotations_jac(x, opt_data_frozen)
@@ -469,18 +474,24 @@ def integrate(opt_data_frozen, opt_f, *, stepsize=0.1, steps=10, x0=None, maxang
         # derivs and sum them all (each angle's contributions), then we
         # minimize the difference of deriv between correspondence
 
-        scale = min_jac_scale_objective(jac, corr_arr, sign, x0=scale_x0)
-
-        y = scale / scale.sum() * sign
-
         if maxangle is not None:
-            # set deriv to 0 for any angle that is above maxangle
-            y *= jnp.abs(x) < maxangle
+            mask = np.abs(x) < maxangle
+
+        scale = min_jac_scale_objective(jac, corr_arr, sign, x0=scale_x0, mask=mask)
+        a = np.abs(scale)
+        print('scale min', a.max(), a.min(), a.max() / a.min())
+
+        # y = scale / scale.sum() * sign
+        y = scale * sign * mask
+        y /= np.linalg.norm(y)
 
         return scale, y
 
     for i in range(steps):
         print('step', i)
+
+        # if i > 10:
+        #     sign = np.ones_like(sign)
 
         # using the scale returned from k2-4 as scale_x0 makes it go crazy
 
@@ -873,11 +884,12 @@ method = 'integrate'
 
 if method == 'integrate':
     t0 = time.time()
-    angless = integrate(opt_data_frozen, opt_f, steps=500, maxangle=np.pi * 0.99)
+    angless = integrate(opt_data_frozen, opt_f, steps=500, maxangle=np.pi)
     # angless = integrate(opt_data_frozen, opt_f, steps=100)
     t1 = time.time()
     plot_angles(angless)
     angles = angless[-1]
+    print('frames', len(angless))
     plot3_animate(mesh, opt_data_frozen, angless)
 
 elif method == 'snap':
