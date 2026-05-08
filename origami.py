@@ -31,7 +31,7 @@ class SpanningTreeMissingFaces(Exception):
         self.n_missing = n_missing
         super().__init__()
 
-OptData = namedtuple('OptData', ['verts', 'mats', 'children', 'correspondence', 'root', 'x0', 'fcurves', 'faces'])
+OptData = namedtuple('OptData', ['verts', 'mats', 'children', 'correspondence', 'root', 'x0', 'fcurves', 'faces', 'vertex_groups'])
 
 def is_0_180(x, tol=TOL):
     return math.isclose(x, 0, rel_tol=tol) or math.isclose(x, math.pi, rel_tol=tol)
@@ -155,7 +155,7 @@ def face_vert_not_on_edge(face, edge):
 def vector_rejection(a, b):
     return a - a.project(b)
 
-def origami(obj, breadthfirst=True, use_seams=False):
+def origami(obj, breadthfirst=True, use_seams=False, use_vertex_groups=False):
     mesh = bmesh.new()
     mesh.from_mesh(obj.data)
     mesh.edges.ensure_lookup_table()
@@ -167,10 +167,27 @@ def origami(obj, breadthfirst=True, use_seams=False):
     if len(parents) != len(mesh.faces):
         raise SpanningTreeMissingFaces(len(mesh.faces) - len(parents))
 
+    og_vertex_groups = {}
+    for v in obj.data.vertices:
+        if len(v.groups) > 0:
+            og_vertex_groups[v.index] = [g.group for g in v.groups]
+
     faces = {}
+    vertex_groups = defaultdict(list) # {group: [(fi, vi)]}
+
     for f_idx in parents:
         mesh_face = bmesh.new()
         f = mesh.faces[f_idx]
+        if use_vertex_groups:
+            for i, v in enumerate(f.verts):
+                groups = og_vertex_groups.get(v.index)
+                if groups is None:
+                    continue
+                if len(groups) > 1:
+                    raise Exception('expecting vertex to only be in at most 1 group')
+                group_index = groups[0]
+                vertex_groups[group_index].append([f_idx, i])
+
         mesh_face.faces.new([mesh_face.verts.new(x.co) for x in f.verts])
         bmesh.ops.recalc_face_normals(mesh_face, faces=mesh_face.faces)
         o = object_from_bmesh(f'{obj.name_full}face{f_idx:03d}', mesh_face)
@@ -267,6 +284,10 @@ def origami(obj, breadthfirst=True, use_seams=False):
 
     root['correspondence'] = json.dumps(correspondence, separators=(',', ':'))
 
+    # record vertex groups, which we interpret as
+    if use_vertex_groups:
+        root['vertex_groups'] = json.dumps(vertex_groups, separators=(',', ':'))
+
     # fixup normals, still not sure why they are sometimes flipped
     # BUG this isn't reliable, for the most part, the noraml is always inverted and needs flipping, but sometimes there is a false negative or two
     for f_idx in parents:
@@ -333,6 +354,7 @@ def prepare_for_opt(root, get_fcurves=False):
         return face
 
     correspondence = json.loads(root['correspondence'])
+    vertex_groups = json.loads(root['vertex_groups']) if 'vertex_groups' in root else None
     go(root)
     return OptData(
         faces=faces,
@@ -343,6 +365,7 @@ def prepare_for_opt(root, get_fcurves=False):
         root=root['face'],
         x0=d_to_arr(x0),
         fcurves=fcurves,
+        vertex_groups=vertex_groups,
     )
 
 # TODO if i not in angles, cut short; though to do this properly we should figure out the LCA of the faces
@@ -390,6 +413,17 @@ def snap_opt_objective(x, opt_data, log=False):
             print('l1', l1)
             print('l2', l2)
         loss += l1 + l2
+
+    if opt_data.vertex_groups:
+        for gi, members in opt_data.vertex_groups.items():
+            # TODO could do all pairs
+            for i in range(len(members) - 1):
+                f1, v1 = members[i]
+                f2, v2 = members[i + 1]
+                l = ((verts[f1][v1] - verts[f2][v2])**2).sum()
+                if log:
+                    print('vg l', l)
+                loss += l
 
     return loss
 
@@ -554,6 +588,7 @@ class Origamify(bpy.types.Operator):
     constrain_root: bpy.props.BoolProperty(name='Constrain Root', default=False, description='Add an X Limit Rotation Constraint to the root object to always be 0')
     unfold: bpy.props.BoolProperty(name='Unfold', default=False)
     use_seams: bpy.props.BoolProperty(name='Use Seams', default=False, description='Respect marked seams by never hinging on them')
+    use_vertex_groups: bpy.props.BoolProperty(name='Use Vertex Groups', default=False, description='Interpret vertex groups as additional objective for snapping')
 
     @classmethod
     def poll(cls, context):
@@ -562,7 +597,7 @@ class Origamify(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
         try:
-            mesh, root, faces, st, parents, g = origami(obj, breadthfirst=self.breadthfirst, use_seams=self.use_seams)
+            mesh, root, faces, st, parents, g = origami(obj, breadthfirst=self.breadthfirst, use_seams=self.use_seams, use_vertex_groups=self.use_vertex_groups)
         except SpanningTreeMissingFaces as e:
             self.report({'ERROR'}, f'Spanning tree did not cover whole object, missing {e.n_missing} faces. Maybe you have too many seams')
             return {'FINISHED'}
